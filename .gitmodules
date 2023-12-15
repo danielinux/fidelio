@@ -1,0 +1,6 @@
+[submodule "lib/wolfssl"]
+	path = lib/wolfssl
+	url = https://github.com/wolfssl/wolfssl
+[submodule "pico-sdk"]
+	path = pico-sdk
+	url = https://github.com/raspberrypi/pico-sdk
