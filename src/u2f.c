@@ -697,29 +697,3 @@ void tud_hid_report_complete_cb(uint8_t instance, const uint8_t *report,
         U2F_cmd_reply_seq = 0;
     }
 }
-
-#if 0
-/* Poll every 5ms
- */
-void hid_task(void)
-{
-  const uint32_t interval_ms = 5;
-  static uint32_t start_ms = 0;
-  if (!tud_inited())
-      return;
-
-  if ( board_millis() - start_ms < interval_ms)
-      return;
-
-  start_ms += interval_ms;
-
-  // Remote wakeup
-  if ( tud_suspended() ) //&& (tx_buffer_rd > tx_buffer_wr))
-  {
-    /* Wake up host if we are in suspend mode
-     * and REMOTE_WAKEUP feature is enabled by host
-     */
-    tud_remote_wakeup();
-  }
-}
-#endif
