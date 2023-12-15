@@ -83,7 +83,7 @@ make
 
 4. Upload to raspberry pi pico:
 ```
-cp main.uf2 /path/to/RPI-RP2
+cp fidelio.uf2 /path/to/RPI-RP2
 
 ```
 
