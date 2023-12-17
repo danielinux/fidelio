@@ -1,13 +1,28 @@
 # Fidelio
 
+## Turn a rp2040 into a personal authentication key
+
 Universal 2FA using Raspberry Pi Pico (rp2040) and wolfCrypt. Works with any
 raspberry-pi pico device with only one component added (pushbutton on GPIO15).
 
-
 ### Goals and security model
 
-Fidelio is indicated to implement the second factor in 2FA services. Two-factor
-authentication based on U2F mechanism is generally considered more secure than time-based
+Fidelio implements a U2F/Fido security key, generally used as second factor in
+2FA services, or in some specific cases for password-less authentication.
+
+Associating a 2FA authentication service to a hardware key as second factor will
+require the user to provide the key to prove that they are still in possess of 
+the hardware key that was initially registered.
+
+The holder of the key can only prove the physical presence of the key during an
+authentication procedure. This is done by connecting it via USB and pushing a button.
+
+Through this mechanism, the U2F/Fido2 authenticator is given a proof that the 
+request has been processed (signed) by the same key initially registeded , so the
+user can be trusted as the authenticator assumes that the user is still holding
+the key.
+
+Two-factor authentication based on U2F mechanism is generally considered more secure than time-based
 OTP services, like mobile apps or other devices that require clock synchronization with the
 authenticating party.
 
@@ -41,6 +56,16 @@ U2F-Fido2 protocol mandates the use of a single button to indicate that the user
 is actually present when the key is used.
 
 For this purpose, Fidelio requires to add a push-button between GPIO15 and GND.
+
+On the Raspberry-pi pico board, this button can normally be soldered in place:
+
+![Raspberry Pico soldering](doc/raspi_mod_button.png)
+
+
+If you are using a different model and/or you want to change the pin for the U2F
+presence button, just edit [button.h](src/button.h) and change the pin number
+defined by the macro `PRESENCE_BUTTON`.
+
 
 ### How to build:
 
@@ -108,4 +133,46 @@ To ensure that your device is correctly working, connect Fidelio to your PC and
 visit the demo website provided by Yubico:
 
 https://demo.yubico.com/webauthn-technical/registration
+
+### Usage
+
+#### Service example: github second factor
+
+Go to your profile settings. Select "Password and authentication" from the Access menu.
+
+Find the "Two factor authentication" configuration at the bottom of the page. Check the 
+"Security Keys" option:
+
+![github.com 2FA config](doc/github_register_key.png)
+
+The button "Register new security key" will associate the device running fidelio
+as a second factor to access your github account. Give it a unique name of your 
+choice.
+
+![github.com 2FA security key configured](doc/github_configured.png)
+
+It is a good idea to configure more than one 2FA mechanism to your account to
+avoid the risk of being locked out of your account. This of course includes the
+possibility to use more than one fidelio hardware keys, stored in different places.
+
+#### Local PAM services
+
+To test on a linux machine, install `libpam-u2f` and `pamu2fcfg`.
+
+With the command `pamu2fcfg` you can register a new key associated to your device.
+See `man pamu2fcfg` for information about command line options.
+
+The package `libpam-u2f` provides a module for PAM. Keys created with pamu2fcfg
+can be used as extra (or sole) authentication step for any pam service in `/etc/pam.d`.
+
+It is possible for example to configure password-less login, `sudo`, or other
+operations by setting the u2f module as `sufficient` in the corresponding pam.d
+file, or as extra authentication step, if the keyword `required` is used, instead.
+
+For more information about configuring your services to use libpam-u2f, see the
+libpam-u2f documentation (available via `man pam_u2f`).
+
+**Ensure you always keep a root console open when changing pam.d configuration, and
+to test your changes properly after each change, to avoid locking yourself out of
+your machine**
 
