@@ -11,13 +11,13 @@ Fidelio implements a U2F/Fido security key, generally used as second factor in
 2FA services, or in some specific cases for password-less authentication.
 
 Associating a 2FA authentication service to a hardware key as second factor will
-require the user to provide the key to prove that they are still in possess of 
+require the user to provide the key to prove that they are still in possess of
 the hardware key that was initially registered.
 
 The holder of the key can only prove the physical presence of the key during an
 authentication procedure. This is done by connecting it via USB and pushing a button.
 
-Through this mechanism, the U2F/Fido2 authenticator is given a proof that the 
+Through this mechanism, the U2F/Fido1.2 authenticator is given a proof that the
 request has been processed (signed) by the same key initially registeded , so the
 user can be trusted as the authenticator assumes that the user is still holding
 the key.
@@ -48,11 +48,11 @@ A rp2040 board running Fidelio will not store any credentials or traces that can
 with any running server. The only two pieces of information stored in the target's FLASH memory
 are the device's master key, generated on first use, and a counter keeping track
 of the number of crypto operation done throughout the lifetime of the device, as
-mandated by the U2F-Fido protocol. 
+mandated by the U2F-Fido protocol.
 
 ### Hardware requirements
 
-U2F-Fido2 protocol mandates the use of a single button to indicate that the user
+U2F-Fido1.2 protocol mandates the use of a single button to indicate that the user
 is actually present when the key is used.
 
 For this purpose, Fidelio requires to add a push-button between GPIO15 and GND.
@@ -74,7 +74,7 @@ defined by the macro `PRESENCE_BUTTON`.
 ```
 git clone https://github.com/danielinux/fidelio.git
 cd fidelio
-git submodule update --init --single-branch pico-sdk lib/wolfssl 
+git submodule update --init --single-branch pico-sdk lib/wolfssl
 cd pico-sdk
 git submodule update --init --single-branch lib/tinyusb
 cd ..
@@ -140,13 +140,13 @@ https://demo.yubico.com/webauthn-technical/registration
 
 Go to your profile settings. Select "Password and authentication" from the Access menu.
 
-Find the "Two factor authentication" configuration at the bottom of the page. Check the 
+Find the "Two factor authentication" configuration at the bottom of the page. Check the
 "Security Keys" option:
 
 ![github.com 2FA config](doc/github_register_key.png)
 
 The button "Register new security key" will associate the device running fidelio
-as a second factor to access your github account. Give it a unique name of your 
+as a second factor to access your github account. Give it a unique name of your
 choice.
 
 ![github.com 2FA security key configured](doc/github_configured.png)
