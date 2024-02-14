@@ -63,8 +63,8 @@ On the Raspberry-pi pico board, this button can normally be soldered in place:
 
 
 If you are using a different model and/or you want to change the pin for the U2F
-presence button, just edit [button.h](src/button.h) and change the pin number
-defined by the macro `PRESENCE_BUTTON`.
+presence button and LED, just edit [pins.h](src/pins.h) and change the pin number
+defined by the macro `PRESENCE_BUTTON` and `U2F_LED`, respectively.
 
 
 ### How to build:

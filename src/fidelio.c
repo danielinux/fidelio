@@ -25,15 +25,13 @@
 #include "hardware/gpio.h"
 #include "hardware/adc.h"
 #include "bsp/board.h"
-#include "button.h"
+#include "pins.h"
 #include "tusb.h"
 #include "usb_descriptors.h"
 #include "user_settings.h"
 #include "wolfssl/wolfcrypt/settings.h"
     
 extern void u2f_init(void);
-/* DOUT */
-#define PICO_LED    PICO_DEFAULT_LED_PIN
 
 void system_boot(void)
 {
@@ -41,13 +39,13 @@ void system_boot(void)
     set_sys_clock_48mhz();
     
     /* Setting GPIOs for Led + Button */
-    gpio_init(PICO_LED);
-    gpio_set_dir(PICO_LED, GPIO_OUT);
+    gpio_init(U2F_LED);
+    gpio_set_dir(U2F_LED, GPIO_OUT);
 
     gpio_init(PRESENCE_BUTTON);
     gpio_set_dir(PRESENCE_BUTTON, GPIO_IN);
     gpio_pull_up(PRESENCE_BUTTON);
-    
+
     /* Initializing U2F parser */
     u2f_init();
 

@@ -32,7 +32,7 @@
 #include "wolfssl/wolfcrypt/asn.h"
 #include "wolfssl/wolfcrypt/hmac.h"
 #include "cert.h"
-#include "button.h"
+#include "pins.h"
 
 
 #define PUBKEY_SZ 65
@@ -41,6 +41,7 @@
 #define SIGMAX_SZ 75
 #define HASH_SZ   32
 #define NONCE_SZ  32
+
 
 #define U2FHID_PACKET_SIZE 64
 #define U2FHID_MAX_PAYLOAD (U2FHID_PACKET_SIZE - 7 + 128 * (U2FHID_PACKET_SIZE - 5)) /* = 7609 bytes */
@@ -65,7 +66,7 @@ static void flash_master_keygen(void)
 {
     WC_RNG rng;
     uint8_t mkey_buffer[4 + 32];
-    gpio_put(PICO_DEFAULT_LED_PIN, 1);
+    gpio_put(U2F_LED, 1);
     wc_InitRng(&rng);
     wc_RNG_GenerateBlock(&rng, mkey_buffer, 32);
     flash_range_erase(FLASH_MKEY_OFF, FLASH_SECTOR_SIZE);
@@ -75,7 +76,7 @@ static void flash_master_keygen(void)
     flash_range_program(FLASH_MKEY_OFF, (void *)&master_magic, 4);
     flash_range_program(FLASH_MKEY_OFF + 4, mkey_buffer, 32);
     wc_FreeRng(&rng);
-    gpio_put(PICO_DEFAULT_LED_PIN, 0);
+    gpio_put(U2F_LED, 0);
 }
 
 static void U2F_Counter_up(void)
@@ -253,14 +254,14 @@ static uint16_t fido_register(struct u2f_raw_hdr *hdr, uint16_t len)
     (void)len;
 
 
-    gpio_put(PICO_DEFAULT_LED_PIN, 1);
+    gpio_put(U2F_LED, 1);
     while(1) {
         sleep_ms(2);
         if (gpio_get(PRESENCE_BUTTON) == 0) {
             break;
         }
     }
-    gpio_put(PICO_DEFAULT_LED_PIN, 0);
+    gpio_put(U2F_LED, 0);
 
     /* Initialize wolfCrypt objects */
     if (wc_InitRng(&rng) != 0)
@@ -402,7 +403,7 @@ static uint16_t fido_auth(struct u2f_raw_hdr *hdr, uint16_t len)
         case 0x08: /* Sign with no presence */
             break;
         case 0x03:
-            gpio_put(PICO_DEFAULT_LED_PIN, 1);
+            gpio_put(U2F_LED, 1);
             while(1) {
                 sleep_ms(2);
                 if (gpio_get(PRESENCE_BUTTON) == 0) {
@@ -410,7 +411,7 @@ static uint16_t fido_auth(struct u2f_raw_hdr *hdr, uint16_t len)
                     break;
                 }
             }
-            gpio_put(PICO_DEFAULT_LED_PIN, 0);
+            gpio_put(U2F_LED, 0);
             break;
         default:
             return EWRONGDATA;
