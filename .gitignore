@@ -14,7 +14,7 @@ elf2uf2
 *.der
 *.csr
 
-src/cert.c
+# Leave as default - src/cert.c
 
 
 CMakeCache.txt
