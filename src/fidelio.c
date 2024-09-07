@@ -30,6 +30,7 @@
 #include "usb_descriptors.h"
 #include "user_settings.h"
 #include "wolfssl/wolfcrypt/settings.h"
+#include "hardware/clocks.h"
     
 extern void u2f_init(void);
 
