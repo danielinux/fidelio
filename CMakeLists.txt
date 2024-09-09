@@ -61,7 +61,10 @@ target_sources(${PROJECT} PUBLIC
         target_link_libraries(${PROJECT} PUBLIC pico_multicore)
         target_link_libraries(${PROJECT} PUBLIC hardware_adc)
         target_link_libraries(${PROJECT} PUBLIC hardware_flash)
-
+        target_link_libraries(${PROJECT} PUBLIC pico_unique_id)
+        target_link_libraries(${PROJECT} PUBLIC tinyusb_device) 
+        target_link_libraries(${PROJECT} PUBLIC tinyusb_board)
+		
 		# Configure compilation flags and libraries# Cater for Pico W
 		if (PICO_CYW43_SUPPORTED)
 			message("It's a Pico W.....")
@@ -70,4 +73,4 @@ target_sources(${PROJECT} PUBLIC
 
         # Configure compilation flags and libraries for the example... see the corresponding function
         # in hw/bsp/FAMILY/family.cmake for details.
-        family_configure_device_example(${PROJECT})
+        # family_configure_device_example(${PROJECT}) // Not needed?
