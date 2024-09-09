@@ -71,6 +71,5 @@ target_sources(${PROJECT} PUBLIC
 			target_link_libraries(${PROJECT} PUBLIC pico_cyw43_arch_none hardware_clocks)
 		endif()
 
-        # Configure compilation flags and libraries for the example... see the corresponding function
-        # in hw/bsp/FAMILY/family.cmake for details.
-        # family_configure_device_example(${PROJECT}) // Not needed?
+		pico_add_extra_outputs(${PROJECT})
+
