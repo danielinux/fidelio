@@ -23,4 +23,8 @@
 
 #define PRESENCE_BUTTON 15
 
+#ifndef U2F_LED
+#define U2F_LED PICO_DEFAULT_LED_PIN
+#endif
+
 #endif
