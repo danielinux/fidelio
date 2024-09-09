@@ -20,36 +20,39 @@
  */
 
 #include "led.h"
-// Pico W devices use a GPIO on the WIFI chip for the LED,
-// so when building for Pico W, CYW43_WL_GPIO_LED_PIN will be defined
+/* Pico W devices use a GPIO on the WIFI chip for the LED,
+ * so when building for Pico W, CYW43_WL_GPIO_LED_PIN will be defined
+ */
+
 #ifdef CYW43_WL_GPIO_LED_PIN
 #include "pico/cyw43_arch.h"
 #include "pico/cyw43_driver.h"
 #include "hardware/clocks.h"
 #endif
 
-// Perform initialisation
+/* Perform initialization */
 int u2f_led_init(void) {
 #ifndef CYW43_WL_GPIO_LED_PIN
-    // A device like Pico that uses a GPIO for the LED will define PICO_DEFAULT_LED_PIN
-    // so we can use normal GPIO functionality to turn the led on and off
-    gpio_init(PICO_DEFAULT_LED_PIN);
-    gpio_set_dir(PICO_DEFAULT_LED_PIN, GPIO_OUT);
+    /* A device like Pico that uses a GPIO for the LED will define U2F_LED
+     * so we can use normal GPIO functionality to turn the led on and off  
+	 */
+    gpio_init(U2F_LED);
+    gpio_set_dir(U2F_LED, GPIO_OUT);
     return PICO_OK;
 #else
-    // For Pico W devices we need to initialise the driver etc
+    /* For Pico W devices we need to initialize the driver etc */
     cyw43_set_pio_clock_divisor(1, 0);
     return cyw43_arch_init();
 #endif
 }
 
-// Turn the led on or off
+/* Turn the led on or off */
 void u2f_set_led(bool led_on) {
 #ifndef CYW43_WL_GPIO_LED_PIN
-    // Just set the GPIO on or off
-    gpio_put(PICO_DEFAULT_LED_PIN, led_on);
+    /* Just set the GPIO on or off */
+    gpio_put(U2F_LED, led_on);
 #else
-    // Ask the wifi "driver" to set the GPIO on or off
+    /* Ask the wifi "driver" to set the GPIO on or off */
     cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, led_on);
 #endif
 }

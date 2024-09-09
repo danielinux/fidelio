@@ -23,6 +23,8 @@
 
 #include "pico/stdlib.h"
 
+#define U2F_LED PICO_DEFAULT_LED_PIN
+
 int u2f_led_init(void);
 void u2f_set_led(bool led_on);
 

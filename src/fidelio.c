@@ -37,11 +37,13 @@ extern void u2f_init(void);
 
 void system_boot(void)
 {
+	int rc;
+	
     /* Setting system clock */
     set_sys_clock_48mhz();
     
     /* Setting GPIOs for Led + Button */
-    int rc = u2f_led_init();
+    rc = u2f_led_init();
     hard_assert(rc == PICO_OK);
 
     gpio_init(PRESENCE_BUTTON);
