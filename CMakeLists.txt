@@ -25,6 +25,7 @@ target_sources(${PROJECT} PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/src/rand.c
         ${CMAKE_CURRENT_SOURCE_DIR}/src/cert.c
         ${CMAKE_CURRENT_SOURCE_DIR}/src/u2f.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/led.c
         ${CMAKE_CURRENT_SOURCE_DIR}/src/usb_descriptors.c
         ${CMAKE_CURRENT_SOURCE_DIR}/lib/wolfssl/wolfcrypt/src/asn.c
         ${CMAKE_CURRENT_SOURCE_DIR}/lib/wolfssl/wolfcrypt/src/wc_port.c
@@ -46,13 +47,14 @@ target_sources(${PROJECT} PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/lib/wolfssl/wolfcrypt/src/sp_c32.c
         )
 
-# Example include
-target_include_directories(${PROJECT} PUBLIC
+        # Example include
+        target_include_directories(${PROJECT} PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/src 
         ${CMAKE_CURRENT_SOURCE_DIR}/lib/wolfssl
         )
 
-        target_compile_definitions( ${PROJECT} PUBLIC WOLFSSL_USER_SETTINGS)
+        target_compile_definitions(${PROJECT} PUBLIC WOLFSSL_USER_SETTINGS)
+        target_compile_definitions(${PROJECT} PRIVATE CYW43_PIO_CLOCK_DIV_DYNAMIC=1)
 
 
         target_link_libraries(${PROJECT} PUBLIC pico_stdlib)
@@ -60,6 +62,11 @@ target_include_directories(${PROJECT} PUBLIC
         target_link_libraries(${PROJECT} PUBLIC hardware_adc)
         target_link_libraries(${PROJECT} PUBLIC hardware_flash)
 
-# Configure compilation flags and libraries for the example... see the corresponding function
+		# Configure compilation flags and libraries# Cater for Pico W
+		if (PICO_CYW43_SUPPORTED)
+			message("It's a Pico W.....")
+			target_link_libraries(${PROJECT} PUBLIC pico_cyw43_arch_none hardware_clocks)
+		endif()
+ for the example... see the corresponding function
 # in hw/bsp/FAMILY/family.cmake for details.
 family_configure_device_example(${PROJECT})

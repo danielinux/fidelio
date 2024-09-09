@@ -31,6 +31,7 @@
 #include "user_settings.h"
 #include "wolfssl/wolfcrypt/settings.h"
 #include "hardware/clocks.h"
+#include "led.h" 
     
 extern void u2f_init(void);
 
@@ -40,19 +41,23 @@ void system_boot(void)
     set_sys_clock_48mhz();
     
     /* Setting GPIOs for Led + Button */
-    gpio_init(U2F_LED);
-    gpio_set_dir(U2F_LED, GPIO_OUT);
+    int rc = u2f_led_init();
+    hard_assert(rc == PICO_OK);
 
     gpio_init(PRESENCE_BUTTON);
     gpio_set_dir(PRESENCE_BUTTON, GPIO_IN);
     gpio_pull_up(PRESENCE_BUTTON);
+
+    /* Momentarily blink led on startup - functioning indicator */
+    u2f_set_led(1);
+    sleep_ms(250);
+    u2f_set_led(0);
 
     /* Initializing U2F parser */
     u2f_init();
 
     /* Initializing TinyUSB device */
     tusb_init();
-
 }
 
 int main(void) {

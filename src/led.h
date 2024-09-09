@@ -18,9 +18,12 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1335, USA
  *
  */
-#ifndef BUTTON_H
-#define BUTTON_H
+#ifndef U2F_LED_H
+#define U2F_LED_H
 
-#define PRESENCE_BUTTON 15
+#include "pico/stdlib.h"
+
+int u2f_led_init(void);
+void u2f_set_led(bool led_on);
 
 #endif
