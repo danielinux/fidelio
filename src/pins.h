@@ -19,11 +19,12 @@
  *
  */
 #ifndef BUTTON_H
-    #define BUTTON_H
+#define BUTTON_H
 
-    #define PRESENCE_BUTTON 15
+#define PRESENCE_BUTTON 15
 
     #if !defined(U2F_LED) && defined(PICO_DEFAULT_LED_PIN)
     #define U2F_LED PICO_DEFAULT_LED_PIN
     #endif
+
 #endif
