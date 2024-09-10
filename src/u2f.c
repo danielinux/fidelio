@@ -34,6 +34,7 @@
 #include "cert.h"
 #include "pins.h"
 #include "led.h"
+#include "presence.h"
 
 
 #define PUBKEY_SZ 65
@@ -258,7 +259,7 @@ static uint16_t fido_register(struct u2f_raw_hdr *hdr, uint16_t len)
     u2f_set_led(1);
     while(1) {
         sleep_ms(2);
-        if (gpio_get(PRESENCE_BUTTON) == 0) {
+        if (get_presence()) {
             break;
         }
     }
@@ -407,7 +408,7 @@ static uint16_t fido_auth(struct u2f_raw_hdr *hdr, uint16_t len)
             u2f_set_led(1);
             while(1) {
                 sleep_ms(2);
-                if (gpio_get(PRESENCE_BUTTON) == 0) {
+                if (get_presence()) {
                     user_presence = 0x01;
                     break;
                 }

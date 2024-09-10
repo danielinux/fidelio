@@ -26,6 +26,7 @@ target_sources(${PROJECT} PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/src/cert.c
         ${CMAKE_CURRENT_SOURCE_DIR}/src/u2f.c
         ${CMAKE_CURRENT_SOURCE_DIR}/src/led.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/presence.c
         ${CMAKE_CURRENT_SOURCE_DIR}/src/usb_descriptors.c
         ${CMAKE_CURRENT_SOURCE_DIR}/lib/wolfssl/wolfcrypt/src/asn.c
         ${CMAKE_CURRENT_SOURCE_DIR}/lib/wolfssl/wolfcrypt/src/wc_port.c

@@ -46,10 +46,13 @@ void system_boot(void)
     rc = u2f_led_init();
     hard_assert(rc == PICO_OK);
 
+	/* If using BOOTSEL don't set the PRESENCE_BUTTON */
+	#ifndef USE_PRESENCE_BUTTON
     gpio_init(PRESENCE_BUTTON);
     gpio_set_dir(PRESENCE_BUTTON, GPIO_IN);
     gpio_pull_up(PRESENCE_BUTTON);
-
+	#endif
+	
     /* Momentarily blink led on startup - functioning indicator */
     u2f_set_led(1);
     sleep_ms(250);
