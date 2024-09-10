@@ -57,6 +57,7 @@ target_sources(${PROJECT} PUBLIC
         target_compile_definitions(${PROJECT} PUBLIC WOLFSSL_USER_SETTINGS)
         target_compile_definitions(${PROJECT} PRIVATE CYW43_PIO_CLOCK_DIV_DYNAMIC=1)
 
+		# target_compile_definitions(${PROJECT} PUBLIC USE_BOOTSEL_BUTTON)
 
         target_link_libraries(${PROJECT} PUBLIC pico_stdlib)
         target_link_libraries(${PROJECT} PUBLIC pico_multicore)
