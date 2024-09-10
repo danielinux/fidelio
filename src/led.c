@@ -33,12 +33,14 @@
 
 /* Perform initialization */
 int u2f_led_init(void) {
-#ifndef CYW43_WL_GPIO_LED_PIN
+#ifdef U2F_LED
+    #if (U2F_LED >= 0)
     /* A device like Pico that uses a GPIO for the LED will define U2F_LED
      * so we can use normal GPIO functionality to turn the led on and off  
 	 */
     gpio_init(U2F_LED);
     gpio_set_dir(U2F_LED, GPIO_OUT);
+    #endif
     return PICO_OK;
 #else
     /* For Pico W devices we need to initialize the driver etc */
@@ -49,12 +51,15 @@ int u2f_led_init(void) {
 
 /* Turn the led on or off */
 void u2f_set_led(bool led_on) {
-#ifndef CYW43_WL_GPIO_LED_PIN
+#ifdef U2F_LED
+    #if (U2F_LED >= 0)
     /* Just set the GPIO on or off */
     gpio_put(U2F_LED, led_on);
+    #endif
 #else
+    #ifdef CYW43_WL_GPIO_LED_PIN
     /* Ask the wifi "driver" to set the GPIO on or off */
     cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, led_on);
+    #endif
 #endif
 }
-
