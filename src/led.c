@@ -1,6 +1,6 @@
 /* Fidelio
  *
- * (c) 2023 Peardox
+ * (c) 2023 Daniele Lacamera <root@danielinux.net>
  *
  *
  * Fidelio is free software; you can redistribute it and/or modify
