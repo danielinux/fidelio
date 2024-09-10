@@ -22,6 +22,8 @@
 #define BUTTON_H
 
 #define PRESENCE_BUTTON 15
+/* Allow for pull-up/pull-down */
+#define PRESENCE_PRESSED 0
 
     #if !defined(U2F_LED) && defined(PICO_DEFAULT_LED_PIN)
     #define U2F_LED PICO_DEFAULT_LED_PIN
