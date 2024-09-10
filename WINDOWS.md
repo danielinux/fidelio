@@ -39,7 +39,9 @@ Get the zip from https://sourceforge.net/projects/xxd-for-windows/ Use your favo
 To make sure the above utilities are installed correctly open a command prompt and enter the following commands....
 
 openssl -h
+
 sed -h
+
 xxd -h
 
 All three should display some usage information. If they don't then you've most likely not added them to your path correctly
