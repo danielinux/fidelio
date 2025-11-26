@@ -69,7 +69,6 @@ extern int custom_random_seed(unsigned char* output, unsigned int sz);
 /* Disables - For minimum wolfCrypt build */
 #define NO_CMAC
 #define NO_RSA
-#define NO_BIG_INT
 #define NO_RC4
 #define NO_SHA
 #define NO_DH
