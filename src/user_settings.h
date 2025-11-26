@@ -41,7 +41,6 @@ extern int custom_random_seed(unsigned char* output, unsigned int sz);
 #   define ECC_TIMING_RESISTANT
 //#   define ECC_USER_CURVES /* enables only 256-bit by default */
 /* ECC options disabled to reduce size */
-#   define NO_ECC_DHE
 #   define HAVE_ECC256
 #   define FP_MAX_BITS (256 + 256)
 #   define SP_WORD_SIZE 32

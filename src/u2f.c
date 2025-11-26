@@ -21,9 +21,11 @@
 
 #include <stdint.h>
 #include <string.h>
+#include <stdbool.h>
 #include "pico/stdlib.h"
 #include "hardware/gpio.h"
 #include "hardware/flash.h"
+#include "hardware/watchdog.h"
 #include "bsp/board.h"
 #include "class/hid/hid.h"
 #include "class/hid/hid_device.h"
@@ -32,6 +34,8 @@
 #include "wolfssl/wolfcrypt/asn.h"
 #include "wolfssl/wolfcrypt/hmac.h"
 #include "cert.h"
+#include "ctap2.h"
+#include "device_state.h"
 #include "pins.h"
 
 
@@ -62,31 +66,55 @@ static uint32_t *magic_check = (uint32_t *)FLASH_MKEY;
 
 static uint32_t U2F_Counter = 0;
 
-static void flash_master_keygen(void)
+static void write_counter_page(uint32_t flash_off, uint32_t value)
+{
+    uint8_t page_buf[FLASH_PAGE_SIZE];
+    memcpy(page_buf, (const void *)(XIP_BASE + flash_off), FLASH_PAGE_SIZE);
+    memcpy(page_buf, &value, 4);
+    flash_range_program(flash_off, page_buf, FLASH_PAGE_SIZE);
+}
+
+static void write_master_page(uint32_t flash_off, const uint8_t *key, uint32_t magic)
+{
+    uint8_t page_buf[FLASH_PAGE_SIZE];
+    memcpy(page_buf, (const void *)(XIP_BASE + flash_off), FLASH_PAGE_SIZE);
+    memcpy(page_buf, &magic, 4);
+    memcpy(page_buf + 4, key, 32);
+    flash_range_program(flash_off, page_buf, FLASH_PAGE_SIZE);
+}
+
+/* Run flash ops from RAM to avoid XIP stalls */
+static void __not_in_flash_func(flash_master_keygen)(void)
 {
     WC_RNG rng;
     uint8_t mkey_buffer[4 + 32];
-    gpio_put(U2F_LED, 1);
+    /* Keep LED off during keygen; turn it on once ready for acknowledgment */
+    gpio_put(U2F_LED, 0);
     wc_InitRng(&rng);
     wc_RNG_GenerateBlock(&rng, mkey_buffer, 32);
     flash_range_erase(FLASH_MKEY_OFF, FLASH_SECTOR_SIZE);
     flash_range_erase(FLASH_CTR_ADDR0_OFF, FLASH_SECTOR_SIZE);
     flash_range_erase(FLASH_CTR_ADDR1_OFF, FLASH_SECTOR_SIZE);
-    flash_range_program(FLASH_CTR_ADDR0_OFF, (void *)&U2F_Counter, 4);
-    flash_range_program(FLASH_MKEY_OFF, (void *)&master_magic, 4);
-    flash_range_program(FLASH_MKEY_OFF + 4, mkey_buffer, 32);
-    wc_FreeRng(&rng);
-    gpio_put(U2F_LED, 0);
+    write_counter_page(FLASH_CTR_ADDR0_OFF, U2F_Counter);
+    write_master_page(FLASH_MKEY_OFF, mkey_buffer, master_magic);
+    /* Signal ready and wait for presence press to confirm first-boot provisioning */
+    gpio_put(U2F_LED, 1);
+    while (gpio_get(PRESENCE_BUTTON) != 0) {
+        sleep_ms(2);
+    }
+    sleep_ms(50);
+    watchdog_reboot(0, 0, 0);
+    while (1) { tight_loop_contents(); }
 }
 
-static void U2F_Counter_up(void)
+static void __not_in_flash_func(U2F_Counter_up)(void)
 {
     U2F_Counter++;
     if ((U2F_Counter & 0x01) == 0x01) {
-        flash_range_program(FLASH_CTR_ADDR1_OFF, (void *)&U2F_Counter, 4);
+        write_counter_page(FLASH_CTR_ADDR1_OFF, U2F_Counter);
         flash_range_erase(FLASH_CTR_ADDR0_OFF, FLASH_SECTOR_SIZE);
     } else {
-        flash_range_program(FLASH_CTR_ADDR0_OFF, (void *)&U2F_Counter, 4);
+        write_counter_page(FLASH_CTR_ADDR0_OFF, U2F_Counter);
         flash_range_erase(FLASH_CTR_ADDR1_OFF, FLASH_SECTOR_SIZE);
     }
 }
@@ -195,7 +223,7 @@ static uint32_t U2F_cmd_reply_sent = 0;
 static uint32_t U2F_cmd_reply_size = 0;
 static uint32_t U2F_cmd_reply_seq = 0;
 
-static int u2fhid_sendmsg(uint16_t sz, int err)
+static int ctaphid_send(uint8_t cmd, uint16_t sz, bool append_status_word)
 {
     uint8_t u2h_msg[U2FHID_PACKET_SIZE];
     struct u2fhid_init_packet *ip;
@@ -204,17 +232,17 @@ static int u2fhid_sendmsg(uint16_t sz, int err)
     memset(u2h_msg, 0, U2FHID_PACKET_SIZE);
     U2F_cmd_reply_sent = 0;
     U2F_cmd_reply_seq = 0;
-    if (err) {
-        U2F_cmd_reply_size = sz;
-    } else {
+    if (append_status_word) {
         U2F_cmd_reply_size = sz + 2;
         U2F_cmd_reply[sz] = 0x90;
         U2F_cmd_reply[sz + 1] = 0x00;
+    } else {
+        U2F_cmd_reply_size = sz;
     }
 
     ip = (struct u2fhid_init_packet *)u2h_msg;
-    ip->cid = 0;
-    ip->hid_cmd = 0x80 | CTAP_CMD_MSG;
+    ip->cid = U2F_Message.cid;
+    ip->hid_cmd = 0x80 | cmd;
     ip->payload_len[0] = ((U2F_cmd_reply_size) & 0xFF00) >> 8;
     ip->payload_len[1] = (U2F_cmd_reply_size) & 0xFF;
     len = U2FHID_PACKET_SIZE - 7;
@@ -362,7 +390,7 @@ static uint16_t fido_register(struct u2f_raw_hdr *hdr, uint16_t len)
     memcpy(&U2F_cmd_reply[idx], signature, siglen);
     idx += siglen;
     /* Send the reply */
-    u2fhid_sendmsg((uint16_t)idx, 0);
+    ctaphid_send(CTAP_CMD_MSG, (uint16_t)idx, true);
     wc_FreeRng(&rng);
     wc_ecc_free(&user_ecc);
     wc_ecc_free(&cert_ecc);
@@ -487,7 +515,7 @@ static uint16_t fido_auth(struct u2f_raw_hdr *hdr, uint16_t len)
     U2F_Counter_up();
 
     /* Send the reply */
-    u2fhid_sendmsg((uint16_t)(siglen + 5), 0);
+    ctaphid_send(CTAP_CMD_MSG, (uint16_t)(siglen + 5), true);
     wc_FreeRng(&rng);
     wc_ecc_free(&user_ecc);
     ForceZero(&user_ecc, sizeof(ecc_key));
@@ -532,11 +560,29 @@ static uint16_t parse_u2f_raw_msg(void)
             return fido_auth(hdr, (uint16_t)len);
         case U2F_VERSION_INS:
             return fido_getversion(hdr, (uint16_t)len);
+        case CTAP_CMD_CBOR:
+            /* Should not reach here: CBOR handled at HID layer */
+            return EINSUNSUPP;
         default:
             return EINSUNSUPP;
     }
     U2F_Message.len = 0;
     return 0x9000;
+}
+
+const uint8_t *device_get_secret(void)
+{
+    return device_secret;
+}
+
+uint32_t device_get_counter(void)
+{
+    return U2F_Counter;
+}
+
+void device_counter_inc(void)
+{
+    U2F_Counter_up();
 }
 
 static void ctap_init_reply(void)
@@ -548,11 +594,11 @@ static void ctap_init_reply(void)
     reply[6] = 17;   /* Len LSB */
     memcpy(reply + 7, U2F_Message.data, 8);
     memset(reply + 15, 0, 4);
-    reply[19] = 1; /* Fido Protocol version */
-    reply[20] = 1; /* Maj V*/
+    reply[19] = 2; /* CTAPHID protocol version */
+    reply[20] = 2; /* Maj V*/
     reply[21] = 0; /* Min V*/
     reply[22] = 0; /* Build V */
-    reply[23] = 0; /* cap flags, 1 for wink */
+    reply[23] = 0x05; /* cap flags: wink + CBOR */
     tud_hid_report(0, reply, U2FHID_PACKET_SIZE);
 }
 
@@ -570,10 +616,21 @@ static uint16_t parse_u2f_raw(void)
                 memcpy(err, &ret, 2);
                 U2F_cmd_reply[0] = err[1];
                 U2F_cmd_reply[1] = err[0];
-                u2fhid_sendmsg(2, 1);
+                ctaphid_send(CTAP_CMD_MSG, 2, false);
                 ret = ENOERR;
             }
             break;
+        case CTAP_CMD_CBOR: {
+            uint16_t reply_len = 0;
+            int ctap2_ret = ctap2_handle_cbor(U2F_Message.data, U2F_Message.len, U2F_cmd_reply, sizeof(U2F_cmd_reply), &reply_len);
+            if (ctap2_ret == 0 && reply_len > 0) {
+                ctaphid_send(CTAP_CMD_CBOR, reply_len, false);
+                ret = ENOERR;
+            } else {
+                ret = EWRONGDATA;
+            }
+            break;
+        }
         default:
             return EWRONGDATA;
     }

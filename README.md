@@ -2,13 +2,14 @@
 
 ## Turn a rp2040 into a personal authentication key
 
-Universal 2FA using Raspberry Pi Pico (rp2040) and wolfCrypt. Works with any
-raspberry-pi pico device with only one component added (pushbutton on GPIO15).
+Universal FIDO2/U2F key using Raspberry Pi Pico (rp2040) and wolfCrypt. Works with
+any raspberry-pi pico device with only one component added (pushbutton on GPIO15).
 
 ### Goals and security model
 
-Fidelio implements a U2F/Fido security key, generally used as second factor in
-2FA services, or in some specific cases for password-less authentication.
+Fidelio implements a FIDO2 authenticator (CTAP2/WebAuthn) with CTAP1/U2F
+compatibility, generally used as second factor in 2FA services, or in some
+specific cases for password-less authentication.
 
 Associating a 2FA authentication service to a hardware key as second factor will
 require the user to provide the key to prove that they are still in possess of
@@ -17,20 +18,21 @@ the hardware key that was initially registered.
 The holder of the key can only prove the physical presence of the key during an
 authentication procedure. This is done by connecting it via USB and pushing a button.
 
-Through this mechanism, the U2F/Fido1.2 authenticator is given a proof that the
-request has been processed (signed) by the same key initially registeded , so the
+Through this mechanism, the authenticator is given a proof that the
+request has been processed (signed) by the same key initially registered, so the
 user can be trusted as the authenticator assumes that the user is still holding
 the key.
 
-Two-factor authentication based on U2F mechanism is generally considered more secure than time-based
+Two-factor authentication based on FIDO mechanisms is generally considered more secure than time-based
 OTP services, like mobile apps or other devices that require clock synchronization with the
 authenticating party.
 
 The device creates a unique private key, which is then used to derive the keys for the
-authenticating services requesting a U2F authentication. This means that Fidelio does
+authenticating services requesting a FIDO authentication. This means that Fidelio does
 not pose any storage limitation on the number of authentication services that can be
 registered, as the same key is derived again whenever needed and it's never stored on
-the device.
+the device. CTAP1/U2F remains supported for legacy services; CTAP2/WebAuthn is the
+primary protocol.
 
 The codebase is simple and rather small, allowing for an easy full audit of the security
 model and the related implementations.
@@ -38,36 +40,37 @@ model and the related implementations.
 
 ### Security considerations
 
-The security of Fidelio, like those of all other similar hw-based U2F devices, depends
-entirely on the physical presence of the hardware. If Fidelio is lost or stolen, the second factor of
-all the registered services must be considered as compromised, and the keys associated to the device should be
-revoked from all the associated services. This usually does not represent an important security risk in itself,
-as long as a first factor is in use (commonly, password authentication).
+The security of Fidelio depends entirely on the physical presence of the hardware. If Fidelio is lost
+or stolen, the second factor of all the registered services must be considered compromised, and the
+keys associated to the device should be revoked from all the associated services. This usually does
+not represent an important security risk in itself, as long as a first factor is in use (commonly,
+password authentication).
 
 A rp2040 board running Fidelio will not store any credentials or traces that can be associated
 with any running server. The only two pieces of information stored in the target's FLASH memory
-are the device's master key, generated on first use, and a counter keeping track
-of the number of crypto operation done throughout the lifetime of the device, as
-mandated by the U2F-Fido protocol.
+are the device's master key, generated on first use, and counters keeping track
+of crypto operations, as mandated by the FIDO protocols.
 
 ### Hardware requirements
 
-U2F-Fido1.2 protocol mandates the use of a single button to indicate that the user
-is actually present when the key is used.
+FIDO/U2F mandates the use of a single button to indicate that the user is
+actually present when the key is used. Without this button the authenticator
+will never assert user presence.
 
-For this purpose, Fidelio requires to add a push-button between GPIO15 and GND.
+For this purpose, Fidelio requires a normally-open push-button between GPIO15
+and GND.
 
 On the Raspberry-pi pico board, this button can normally be soldered in place:
 
 ![Raspberry Pico soldering](doc/raspi_mod_button.png)
 
 
-If you are using a different model and/or you want to change the pin for the U2F
+If you are using a different model and/or you want to change the pin for the
 presence button and LED, just edit [pins.h](src/pins.h) and change the pin number
 defined by the macro `PRESENCE_BUTTON` and `U2F_LED`, respectively.
 
 
-### How to build:
+### Build and flash:
 
 1. Clone this repository, create and populate build directory
 
@@ -92,24 +95,22 @@ script.
 ./mkcert.sh
 ```
 
-3. Execute cmake to create the build directory. Ensure to pass the full absolute
-path to the pico-sdk directory.
+3. Configure CMake (pass the full absolute path to pico-sdk):
 
 ```
 cmake -B build -DPICO_COPY_TO_RAM=1 -DFAMILY=rp2040 -DPICO_SDK_PATH=/path/to/fidelio/pico-sdk
 ```
 
+4. Compile:
 
-4. Compile
 ```
-cd build
-make
+cmake --build build
 ```
 
-4. Upload to raspberry pi pico:
-```
-cp fidelio.uf2 /path/to/RPI-RP2
+5. Flash to the Pico (hold BOOTSEL when plugging in, then copy):
 
+```
+cp build/fidelio.uf2 /path/to/RPI-RP2
 ```
 
 
@@ -117,11 +118,25 @@ cp fidelio.uf2 /path/to/RPI-RP2
 
 The first time the device is plugged in into the computer, it will randomly generate its master key.
 The master key will be then used, for the entire lifetime of the device, to generate
-keys for single U2F services.
+keys for single FIDO services.
 
 Updating the Fidelio firmware to a newer version will not overwrite the master key,
 so the key will keep working with services that had been registered with the old
 firmware as well.
+
+On first boot the LED will stay on while the master key is generated; press the
+presence button once to acknowledge, then the device will reboot automatically.
+
+### Set the FIDO2 PIN
+
+After flashing, set the authenticator PIN:
+
+```
+fido2-token -S /dev/hidrawX    # enter your chosen PIN when prompted
+```
+
+Replace `/dev/hidrawX` with the device path listed by `fido2-token -L`. Press the
+presence button when prompted during this flow.
 
 
 
@@ -130,9 +145,10 @@ firmware as well.
 #### Online services
 
 To ensure that your device is correctly working, connect Fidelio to your PC and
-visit the demo website provided by Yubico:
+visit the WebAuthn.io demo: https://webauthn.io/
 
-https://demo.yubico.com/webauthn-technical/registration
+Use “Register” to create a credential (press the presence button when asked, and
+enter the PIN you set above), then “Login” to exercise getAssertion.
 
 ### Usage
 
@@ -175,4 +191,3 @@ libpam-u2f documentation (available via `man pam_u2f`).
 **Ensure you always keep a root console open when changing pam.d configuration, and
 to test your changes properly after each change, to avoid locking yourself out of
 your machine**
-

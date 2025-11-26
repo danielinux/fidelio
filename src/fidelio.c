@@ -31,6 +31,7 @@
 #include "user_settings.h"
 #include "wolfssl/wolfcrypt/settings.h"
 #include "hardware/clocks.h"
+#include "fdo.h"
     
 extern void u2f_init(void);
 
@@ -49,6 +50,7 @@ void system_boot(void)
 
     /* Initializing U2F parser */
     u2f_init();
+    fdo_init();
 
     /* Initializing TinyUSB device */
     tusb_init();
@@ -63,4 +65,3 @@ int main(void) {
         tud_task();
     }
 }
-
