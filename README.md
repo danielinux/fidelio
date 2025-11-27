@@ -173,21 +173,22 @@ possibility to use more than one fidelio hardware keys, stored in different plac
 
 #### Local PAM services
 
-To test on a linux machine, install `libpam-u2f` and `pamu2fcfg`.
+To test on a linux machine install `libpam-u2f` and `pamu2fcfg`. Run
+`pamu2fcfg -u $USER > ~/.config/Yubico/u2f_keys` (create the directory if needed)
+and press the presence button when prompted. Add a line such as
+`auth sufficient pam_u2f.so authfile=/home/%u/.config/Yubico/u2f_keys cue`
+to the relevant file in `/etc/pam.d` (e.g. `sudo`, `login`) to allow U2F
+assertions as password-less auth or as a second factor; see `man pamu2fcfg`
+and `man pam_u2f` for options and multiple-key setups.
 
-With the command `pamu2fcfg` you can register a new key associated to your device.
-See `man pamu2fcfg` for information about command line options.
-
-The package `libpam-u2f` provides a module for PAM. Keys created with pamu2fcfg
-can be used as extra (or sole) authentication step for any pam service in `/etc/pam.d`.
-
-It is possible for example to configure password-less login, `sudo`, or other
-operations by setting the u2f module as `sufficient` in the corresponding pam.d
-file, or as extra authentication step, if the keyword `required` is used, instead.
-
-For more information about configuring your services to use libpam-u2f, see the
-libpam-u2f documentation (available via `man pam_u2f`).
+For CTAP2/FIDO2 flows install `fido2-tools` and `libpam-fido2`. Confirm detection
+with `fido2-token -L`, then create a resident PAM credential with
+`fido2-cred -M -h pam://$(hostname) -i $USER > ~/.fido2-cred`. Add
+`auth sufficient pam_fido2.so authfile=/home/%u/.fido2-cred rp_id=$(hostname)`
+to the same `/etc/pam.d` service to use the key for FIDO2 password-less login;
+see `man pam_fido2` for tuning user verification, PIN prompts, and per-service
+`rp_id` values (e.g. matching SSH `TrustedUserCAKeys` hostnames).
 
 **Ensure you always keep a root console open when changing pam.d configuration, and
-to test your changes properly after each change, to avoid locking yourself out of
+test your changes properly after each change to avoid locking yourself out of
 your machine**
