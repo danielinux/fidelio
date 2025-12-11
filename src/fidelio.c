@@ -32,6 +32,7 @@
 #include "wolfssl/wolfcrypt/settings.h"
 #include "hardware/clocks.h"
 #include "fdo.h"
+#include "indicator.h"
     
 extern void u2f_init(void);
 
@@ -41,8 +42,7 @@ void system_boot(void)
     set_sys_clock_48mhz();
     
     /* Setting GPIOs for Led + Button */
-    gpio_init(U2F_LED);
-    gpio_set_dir(U2F_LED, GPIO_OUT);
+    indicator_init();
 
     gpio_init(PRESENCE_BUTTON);
     gpio_set_dir(PRESENCE_BUTTON, GPIO_IN);

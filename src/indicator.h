@@ -18,17 +18,11 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1335, USA
  *
  */
-#ifndef BUTTON_H
-#define BUTTON_H
+#ifndef INDICATOR_H
+#define INDICATOR_H
 
-/* Default Board (Raspberry pi Pico RP2040) */
-#define PRESENCE_BUTTON 15
-#define PRESENCE_LED PICO_DEFAULT_LED_PIN
-
-
-/* Rp2040-zero USB v.1.1 */
-//#define PRESENCE_BUTTON 29
-//#define RGB_LED 16
-
+void indicator_init(void);
+void indicator_set_idle(void);
+void indicator_wait_for_button(uint16_t r, uint16_t g, uint16_t b);
 
 #endif

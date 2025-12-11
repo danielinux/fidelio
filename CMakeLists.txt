@@ -27,7 +27,9 @@ target_sources(${PROJECT} PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/src/ctap2.c
         ${CMAKE_CURRENT_SOURCE_DIR}/src/fdo.c
         ${CMAKE_CURRENT_SOURCE_DIR}/src/u2f.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/indicator.c
         ${CMAKE_CURRENT_SOURCE_DIR}/src/usb_descriptors.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/sys_stubs.c
         ${CMAKE_CURRENT_SOURCE_DIR}/lib/wolfssl/wolfcrypt/src/asn.c
         ${CMAKE_CURRENT_SOURCE_DIR}/lib/wolfssl/wolfcrypt/src/wc_port.c
         ${CMAKE_CURRENT_SOURCE_DIR}/lib/wolfssl/wolfcrypt/src/wolfmath.c
@@ -62,6 +64,7 @@ target_include_directories(${PROJECT} PUBLIC
         target_link_libraries(${PROJECT} PUBLIC pico_multicore)
         target_link_libraries(${PROJECT} PUBLIC hardware_adc)
         target_link_libraries(${PROJECT} PUBLIC hardware_flash)
+        target_link_libraries(${PROJECT} PUBLIC hardware_pio)
 
 # Configure compilation flags and libraries for the example... see the corresponding function
 # in hw/bsp/FAMILY/family.cmake for details.

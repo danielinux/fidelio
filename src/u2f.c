@@ -37,6 +37,7 @@
 #include "ctap2.h"
 #include "device_state.h"
 #include "pins.h"
+#include "indicator.h"
 
 
 #define PUBKEY_SZ 65
@@ -89,7 +90,7 @@ static void __not_in_flash_func(flash_master_keygen)(void)
     WC_RNG rng;
     uint8_t mkey_buffer[4 + 32];
     /* Keep LED off during keygen; turn it on once ready for acknowledgment */
-    gpio_put(U2F_LED, 0);
+    indicator_set_idle();
     wc_InitRng(&rng);
     wc_RNG_GenerateBlock(&rng, mkey_buffer, 32);
     flash_range_erase(FLASH_MKEY_OFF, FLASH_SECTOR_SIZE);
@@ -98,11 +99,7 @@ static void __not_in_flash_func(flash_master_keygen)(void)
     write_counter_page(FLASH_CTR_ADDR0_OFF, U2F_Counter);
     write_master_page(FLASH_MKEY_OFF, mkey_buffer, master_magic);
     /* Signal ready and wait for presence press to confirm first-boot provisioning */
-    gpio_put(U2F_LED, 1);
-    while (gpio_get(PRESENCE_BUTTON) != 0) {
-        sleep_ms(2);
-    }
-    sleep_ms(50);
+    indicator_wait_for_button(0x20, 0, 0);
     watchdog_reboot(0, 0, 0);
     while (1) { tight_loop_contents(); }
 }
@@ -281,15 +278,7 @@ static uint16_t fido_register(struct u2f_raw_hdr *hdr, uint16_t len)
     (void)hdr;
     (void)len;
 
-
-    gpio_put(U2F_LED, 1);
-    while(1) {
-        sleep_ms(2);
-        if (gpio_get(PRESENCE_BUTTON) == 0) {
-            break;
-        }
-    }
-    gpio_put(U2F_LED, 0);
+    indicator_wait_for_button(0, 0x20, 0);
 
     /* Initialize wolfCrypt objects */
     if (wc_InitRng(&rng) != 0)
@@ -431,15 +420,7 @@ static uint16_t fido_auth(struct u2f_raw_hdr *hdr, uint16_t len)
         case 0x08: /* Sign with no presence */
             break;
         case 0x03:
-            gpio_put(U2F_LED, 1);
-            while(1) {
-                sleep_ms(2);
-                if (gpio_get(PRESENCE_BUTTON) == 0) {
-                    user_presence = 0x01;
-                    break;
-                }
-            }
-            gpio_put(U2F_LED, 0);
+            indicator_wait_for_button(0,0,0x20);
             break;
         default:
             return EWRONGDATA;
@@ -588,6 +569,7 @@ void device_counter_inc(void)
 static void ctap_init_reply(void)
 {
     uint8_t reply[U2FHID_PACKET_SIZE];
+    memset(reply, 0, sizeof(reply));
     memcpy(reply, &U2F_Message.cid, sizeof(uint32_t));
     reply[4] = CTAP_CMD_INIT | 0x80; 
     reply[5] = 0x00; /* Len MSB */
