@@ -20,6 +20,7 @@
  */
 #include <stdio.h>
 #include <stdint.h>
+#include <stdbool.h>
 #include "pico/stdlib.h"
 #include "pico/multicore.h"
 #include "hardware/gpio.h"
@@ -35,18 +36,52 @@
 #include "indicator.h"
     
 extern void u2f_init(void);
+extern void u2f_factory_reset(void);
+
+#define FACTORY_RESET_HOLD_US (10 * 1000 * 1000)
+
+static void presence_button_init(void)
+{
+    gpio_init(PRESENCE_BUTTON);
+    gpio_set_dir(PRESENCE_BUTTON, GPIO_IN);
+    gpio_pull_up(PRESENCE_BUTTON);
+}
+
+static bool presence_button_pressed(void)
+{
+    return gpio_get(PRESENCE_BUTTON) == 0;
+}
+
+static void factory_reset_startup_check(void)
+{
+    if (!presence_button_pressed())
+        return;
+
+    /* Button held at power-on: arm factory reset before other subsystems start */
+    indicator_init();
+    indicator_set(0x20, 0x20, 0); /* Yellow while counting */
+
+    absolute_time_t pressed_since = get_absolute_time();
+    while (presence_button_pressed()) {
+        if (absolute_time_diff_us(pressed_since, get_absolute_time()) >= FACTORY_RESET_HOLD_US) {
+            u2f_factory_reset();
+        }
+        tight_loop_contents();
+    }
+    indicator_set_idle();
+}
 
 void system_boot(void)
 {
     /* Setting system clock */
     set_sys_clock_48mhz();
     
+    /* Setting GPIOs for Button first, so we can gate startup on long-press */
+    presence_button_init();
+    factory_reset_startup_check();
+
     /* Setting GPIOs for Led + Button */
     indicator_init();
-
-    gpio_init(PRESENCE_BUTTON);
-    gpio_set_dir(PRESENCE_BUTTON, GPIO_IN);
-    gpio_pull_up(PRESENCE_BUTTON);
 
     /* Initializing U2F parser */
     u2f_init();

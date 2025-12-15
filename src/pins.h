@@ -22,13 +22,13 @@
 #define BUTTON_H
 
 /* Default Board (Raspberry pi Pico RP2040) */
-#define PRESENCE_BUTTON 15
-#define PRESENCE_LED PICO_DEFAULT_LED_PIN
+//#define PRESENCE_BUTTON 15
+//#define PRESENCE_LED PICO_DEFAULT_LED_PIN
 
 
 /* Rp2040-zero USB v.1.1 */
-//#define PRESENCE_BUTTON 29
-//#define RGB_LED 16
+#define PRESENCE_BUTTON 29
+#define RGB_LED 16
 
 
 #endif

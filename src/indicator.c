@@ -108,10 +108,15 @@ void indicator_init(void)
 
 void indicator_set_idle(void)
 {
+    indicator_set(0, 0, 0);
+}
+
+void indicator_set(uint16_t r, uint16_t g, uint16_t b)
+{
 #ifdef RGB_LED
-    rgb_write(0, 0, 0);
+    rgb_write((uint8_t)r, (uint8_t)g, (uint8_t)b);
 #else
-    gpio_put(PRESENCE_LED, 0);
+    gpio_put(PRESENCE_LED, (r || g || b) ? 1 : 0);
 #endif
 }
 
@@ -126,7 +131,7 @@ void indicator_wait_for_button(uint16_t r, uint16_t g, uint16_t b)
     asm volatile("dmb");
 
     /* If already pressed, wait for release before arming */
-    rgb_write(r,g,b);
+    indicator_set(r, g, b);
     while (gpio_get(PRESENCE_BUTTON) == 0) {
         sleep_ms(2);
     }
@@ -138,7 +143,7 @@ void indicator_wait_for_button(uint16_t r, uint16_t g, uint16_t b)
     sleep_ms(30); /* Debounce */
     indicator_set_idle();
 #else
-    gpio_put(PRESENCE_LED, 1);
+    indicator_set(r, g, b);
     /* If already pressed, wait for release before arming */
     while (gpio_get(PRESENCE_BUTTON) == 0) {
         sleep_ms(2);

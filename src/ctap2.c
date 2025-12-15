@@ -379,6 +379,8 @@ static void pin_state_reset(void)
     memset(&pin_store, 0, sizeof(pin_store));
     pin_loaded = false;
     pin_token_valid = false;
+    pin_agree_valid = false;
+    pin_agree_consumed = true;
     flash_range_erase(FLASH_PIN_OFF, FLASH_SECTOR_SIZE);
 }
 
@@ -1900,6 +1902,13 @@ static int ctap2_client_pin(const uint8_t *payload, uint16_t payload_len,
             *reply_len = 1;
             return 0;
     }
+}
+
+void ctap2_reset_state(void)
+{
+    pin_state_reset();
+    rk_reset();
+    fdo_reset();
 }
 
 int ctap2_handle_cbor(const uint8_t *payload, uint16_t payload_len,

@@ -38,6 +38,7 @@
 #include "device_state.h"
 #include "pins.h"
 #include "indicator.h"
+#include "fdo.h"
 
 
 #define PUBKEY_SZ 65
@@ -141,6 +142,20 @@ void u2f_init(void)
     } else {
         U2F_Counter = U2F_Counter_load();
     }
+}
+
+void u2f_factory_reset(void)
+{
+    /* Turn LED yellow while wiping state */
+    indicator_set(0x20, 0x20, 0);
+    flash_range_erase(FLASH_MKEY_OFF, FLASH_SECTOR_SIZE);
+    flash_range_erase(FLASH_CTR_ADDR0_OFF, FLASH_SECTOR_SIZE);
+    flash_range_erase(FLASH_CTR_ADDR1_OFF, FLASH_SECTOR_SIZE);
+    ctap2_reset_state();
+    fdo_reset();
+    U2F_Counter = 0;
+    indicator_set_idle();
+    flash_master_keygen();
 }
 
 

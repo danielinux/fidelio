@@ -81,3 +81,10 @@ int fdo_store_owner_pub(const uint8_t *pub, uint16_t len)
     fdo_save();
     return 0;
 }
+
+void fdo_reset(void)
+{
+    memset(&fdo_store, 0, sizeof(fdo_store));
+    fdo_loaded = false;
+    flash_range_erase(FLASH_FDO_OFF, FLASH_SECTOR_SIZE);
+}

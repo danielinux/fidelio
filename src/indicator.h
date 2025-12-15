@@ -23,6 +23,7 @@
 
 void indicator_init(void);
 void indicator_set_idle(void);
+void indicator_set(uint16_t r, uint16_t g, uint16_t b);
 void indicator_wait_for_button(uint16_t r, uint16_t g, uint16_t b);
 
 #endif
