@@ -474,7 +474,7 @@ static int pin_shared_secret(const uint8_t *peer_x, const uint8_t *peer_y, uint8
     uint8_t ecdh[ECC_SZ * 2];
     word32 ecdh_len = sizeof(ecdh);
     uint8_t z[32];
-    if (!pin_agree_valid || pin_agree_consumed)
+    if (!pin_agree_valid)
         return -1;
     wc_ecc_init(&peer);
     ret = wc_ecc_import_unsigned(&peer, peer_x, peer_y, NULL, ECC_SECP256R1);
@@ -495,7 +495,6 @@ static int pin_shared_secret(const uint8_t *peer_x, const uint8_t *peer_y, uint8
     ForceZero(ecdh, sizeof(ecdh));
     ForceZero(z, sizeof(z));
     ForceZero(ss, sizeof(ss));
-    pin_agree_consumed = true;
     return 0;
 }
 
@@ -633,6 +632,23 @@ static int derive_user_key(const uint8_t *rpIdHash, const uint8_t *nonce,
     return 0;
 }
 
+static int derive_cred_random(const uint8_t *rpIdHash, const uint8_t *credId, uint16_t credIdLen,
+                              const uint8_t *priv_key, uint8_t *cred_random)
+{
+    Hmac hmac;
+    if (wc_HmacInit(&hmac, NULL, 0) != 0)
+        return -1;
+    if (wc_HmacSetKey(&hmac, SHA256, priv_key, ECC_SZ) != 0) {
+        wc_HmacFree(&hmac);
+        return -1;
+    }
+    wc_HmacUpdate(&hmac, rpIdHash, HASH_SZ);
+    wc_HmacUpdate(&hmac, credId, credIdLen);
+    wc_HmacFinal(&hmac, cred_random);
+    wc_HmacFree(&hmac);
+    return 0;
+}
+
 static int build_credential_id(WC_RNG *rng, const uint8_t *rpIdHash,
                                uint8_t *credId, uint16_t credIdCap, uint16_t *credIdLen,
                                uint8_t *user_private)
@@ -708,10 +724,17 @@ static int build_authdata_attested(const uint8_t *rpIdHash, uint8_t flags, uint3
 }
 
 static int build_authdata_assert(const uint8_t *rpIdHash, uint8_t flags, uint32_t counter,
+                                 const uint8_t *ext, uint16_t ext_len,
                                  uint8_t *authData, uint16_t authDataCap, uint16_t *authDataLen)
 {
     uint8_t counter_be[4];
-    if (authDataCap < HASH_SZ + 1 + 4)
+    uint16_t needed = HASH_SZ + 1 + 4;
+    uint8_t flags_out = flags;
+    if (ext && ext_len > 0) {
+        flags_out |= 0x80; /* ED */
+        needed = (uint16_t)(needed + ext_len);
+    }
+    if (authDataCap < needed)
         return -1;
     counter_be[0] = (uint8_t)((counter >> 24) & 0xFF);
     counter_be[1] = (uint8_t)((counter >> 16) & 0xFF);
@@ -719,9 +742,14 @@ static int build_authdata_assert(const uint8_t *rpIdHash, uint8_t flags, uint32_
     counter_be[3] = (uint8_t)(counter & 0xFF);
 
     memcpy(authData, rpIdHash, HASH_SZ);
-    authData[HASH_SZ] = flags;
+    authData[HASH_SZ] = flags_out;
     memcpy(&authData[HASH_SZ + 1], counter_be, 4);
-    *authDataLen = HASH_SZ + 1 + 4;
+    if (ext && ext_len > 0) {
+        memcpy(&authData[HASH_SZ + 1 + 4], ext, ext_len);
+        *authDataLen = (uint16_t)(HASH_SZ + 1 + 4 + ext_len);
+    } else {
+        *authDataLen = (uint16_t)(HASH_SZ + 1 + 4);
+    }
     return 0;
 }
 
@@ -837,6 +865,16 @@ struct ga_params {
     const uint8_t *allow_list;
     uint32_t allow_list_len;
     uint32_t allow_count;
+    bool hmac_secret_requested;
+    bool hmac_secret_valid;
+    uint8_t hs_platform_qx[ECC_SZ];
+    uint8_t hs_platform_qy[ECC_SZ];
+    bool hs_key_set;
+    const uint8_t *hs_salt_enc;
+    uint32_t hs_salt_enc_len;
+    const uint8_t *hs_salt_auth;
+    uint32_t hs_salt_auth_len;
+    int hs_pin_protocol;
 };
 
 static int parse_makecred(const uint8_t *buf, uint16_t len, struct mc_params *out)
@@ -1020,6 +1058,132 @@ static int parse_makecred(const uint8_t *buf, uint16_t len, struct mc_params *ou
     return 0;
 }
 
+static bool key_eq(const uint8_t *s, uint32_t len, const char *lit)
+{
+    size_t l = strlen(lit);
+    return len == l && memcmp(s, lit, l) == 0;
+}
+
+static int parse_hmac_secret_input(const uint8_t *buf, uint16_t len, struct ga_params *out)
+{
+    uint8_t major; uint32_t items; uint16_t cons;
+    const uint8_t *p = buf; uint16_t remain = len;
+
+    if (cbor_read_hdr(p, remain, &major, &items, &cons) != 0)
+        return -1;
+    if (major != 5)
+        return -1;
+    p += cons; remain -= cons;
+    for (uint32_t i = 0; i < items; i++) {
+        uint8_t kmajor; uint32_t kval; uint16_t kcons;
+        const uint8_t *ktext = NULL; uint32_t klen = 0; uint16_t ktext_cons = 0;
+        if (cbor_read_hdr(p, remain, &kmajor, &kval, &kcons) != 0)
+            return -1;
+        if (kmajor == 3) {
+            if (cbor_read_text(p, remain, &ktext, &klen, &ktext_cons) != 0)
+                return -1;
+            if (remain < ktext_cons)
+                return -1;
+            p += ktext_cons; remain -= ktext_cons;
+        } else {
+            if (remain < kcons)
+                return -1;
+            p += kcons; remain -= kcons;
+        }
+
+        bool key_is_hs = (kmajor == 3 && key_eq(ktext, klen, "hmac-secret"));
+        if (!key_is_hs) {
+            uint16_t skip;
+            if (cbor_skip(p, remain, &skip) != 0)
+                return -1;
+            p += skip; remain = (uint16_t)(remain - skip);
+            continue;
+        }
+
+        /* Parse inner hmac-secret map */
+        uint8_t imajor; uint32_t iitems; uint16_t icons;
+        if (cbor_read_hdr(p, remain, &imajor, &iitems, &icons) != 0 || imajor != 5)
+            return -1;
+        p += icons; remain -= icons;
+        for (uint32_t j = 0; j < iitems; j++) {
+            uint8_t ikmajor; uint32_t ikval; uint16_t ikcons;
+            const uint8_t *iktext = NULL; uint32_t iklen = 0; uint16_t iktext_cons = 0;
+            if (cbor_read_hdr(p, remain, &ikmajor, &ikval, &ikcons) != 0)
+                return -1;
+            if (ikmajor == 3) {
+                if (cbor_read_text(p, remain, &iktext, &iklen, &iktext_cons) != 0)
+                    return -1;
+                if (remain < iktext_cons)
+                    return -1;
+                p += iktext_cons; remain -= iktext_cons;
+            } else {
+                if (remain < ikcons)
+                    return -1;
+                p += ikcons; remain -= ikcons;
+            }
+
+            bool key_is_agree = (ikmajor == 0 && ikval == 1) || (ikmajor == 3 && key_eq(iktext, iklen, "keyAgreement"));
+            bool key_is_salt_enc = (ikmajor == 0 && ikval == 2) || (ikmajor == 3 && key_eq(iktext, iklen, "saltEnc"));
+            bool key_is_salt_auth = (ikmajor == 0 && ikval == 3) || (ikmajor == 3 && key_eq(iktext, iklen, "saltAuth"));
+            bool key_is_pin_protocol = (ikmajor == 0 && ikval == 4) || (ikmajor == 3 && key_eq(iktext, iklen, "pinProtocol"));
+
+            if (key_is_agree) {
+                uint16_t skip;
+                if (cbor_skip(p, remain, &skip) != 0)
+                    return -1;
+                if (skip > remain)
+                    return -1;
+                if (parse_cose_pubkey(p, skip, out->hs_platform_qx, out->hs_platform_qy) != 0)
+                    return -1;
+                out->hmac_secret_requested = true;
+                out->hs_key_set = true;
+                p += skip; remain = (uint16_t)(remain - skip);
+            } else if (key_is_salt_enc) {
+                const uint8_t *b; uint32_t blen; uint16_t bcons;
+                if (cbor_read_bytes(p, remain, &b, &blen, &bcons) != 0)
+                    return -1;
+                if (blen != 32 && blen != 64)
+                    return -1;
+                out->hs_salt_enc = b;
+                out->hs_salt_enc_len = blen;
+                out->hmac_secret_requested = true;
+                p += bcons; remain -= bcons;
+            } else if (key_is_salt_auth) {
+                const uint8_t *b; uint32_t blen; uint16_t bcons;
+                if (cbor_read_bytes(p, remain, &b, &blen, &bcons) != 0)
+                    return -1;
+                if (blen != 16)
+                    return -1;
+                out->hs_salt_auth = b;
+                out->hs_salt_auth_len = blen;
+                out->hmac_secret_requested = true;
+                p += bcons; remain -= bcons;
+            } else if (key_is_pin_protocol) {
+                uint8_t vmajor; uint32_t vval; uint16_t vcons;
+                if (cbor_read_hdr(p, remain, &vmajor, &vval, &vcons) != 0)
+                    return -1;
+                if (vmajor != 0)
+                    return -1;
+                out->hs_pin_protocol = (int)vval;
+                out->hmac_secret_requested = true;
+                p += vcons; remain -= vcons;
+            } else {
+                uint16_t skip;
+                if (cbor_skip(p, remain, &skip) != 0)
+                    return -1;
+                p += skip; remain = (uint16_t)(remain - skip);
+            }
+        }
+    }
+
+    if (out->hmac_secret_requested &&
+        out->hs_key_set &&
+        out->hs_salt_enc && out->hs_salt_auth) {
+        out->hmac_secret_valid = true;
+    }
+    return 0;
+}
+
 static int parse_getassert(const uint8_t *buf, uint16_t len, struct ga_params *out)
 {
     uint8_t major; uint32_t items; uint16_t cons;
@@ -1090,6 +1254,15 @@ static int parse_getassert(const uint8_t *buf, uint16_t len, struct ga_params *o
                 remain = (uint16_t)(remain - allow_len);
                 break;
             }
+            case 4: { /* extensions */
+                uint16_t skip;
+                if (cbor_skip(p, remain, &skip) != 0)
+                    return -1;
+                if (parse_hmac_secret_input(p, skip, out) != 0)
+                    return -1;
+                p += skip; remain = (uint16_t)(remain - skip);
+                break;
+            }
             case 5: { /* options */
                 uint8_t mmajor; uint32_t mitems; uint16_t vcons;
                 if (cbor_read_hdr(p, remain, &mmajor, &mitems, &vcons) != 0 || mmajor != 5)
@@ -1142,6 +1315,10 @@ static int parse_getassert(const uint8_t *buf, uint16_t len, struct ga_params *o
         return -1;
     if (!out->rp_id || out->rp_id_len == 0)
         return -1;
+    if (out->hs_pin_protocol != 0 && out->hs_pin_protocol != CTAP2_PIN_PROTOCOL_SUPPORTED)
+        return -1;
+    if (out->hmac_secret_requested && !out->hmac_secret_valid)
+        return -1;
     if (!out->allow_rk && (!out->cred_id || out->cred_id_len == 0) && out->allow_list_len == 0)
         return -1;
     return 0;
@@ -1182,9 +1359,10 @@ static int ctap2_write_getinfo(uint8_t *reply, uint16_t reply_max, uint16_t *rep
     if (cbor_put_text(&c, "FIDO_2_0") != 0) return -1;
     //if (cbor_put_text(&c, "U2F_V2") != 0) return -1;
 
-    /* 2: extensions (empty array) */
+    /* 2: extensions */
     if (cbor_put_uint(&c, 2) != 0) return -1;
-    if (cbor_start_array(&c, 0) != 0) return -1;
+    if (cbor_start_array(&c, 1) != 0) return -1;
+    if (cbor_put_text(&c, "hmac-secret") != 0) return -1;
 
     /* 3: aaguid */
     if (cbor_put_uint(&c, 3) != 0) return -1;
@@ -1399,8 +1577,10 @@ static int ctap2_get_assertion(const uint8_t *payload, uint16_t payload_len,
     uint8_t rpIdHash[HASH_SZ];
     uint8_t private[ECC_SZ];
     uint8_t handle_hash[HASH_SZ];
-    uint8_t authData[64];
+    uint8_t authData[256];
     uint16_t authDataLen = 0;
+    uint8_t ext_buf[128];
+    uint16_t ext_len = 0;
     uint8_t sigbuf[SIGMAX_SZ];
     uint8_t digest[HASH_SZ];
     word32 siglen = SIGMAX_SZ;
@@ -1552,7 +1732,62 @@ static int ctap2_get_assertion(const uint8_t *payload, uint16_t payload_len,
     if (pin_verified)
         flags |= 0x04;
 
-    if (build_authdata_assert(rpIdHash, flags, device_get_counter(), authData, sizeof(authData), &authDataLen) != 0) {
+    if (params.hmac_secret_requested) {
+        uint8_t shared[HASH_SZ * 2];
+        uint8_t salt_dec[64];
+        uint8_t hs_output[64];
+        uint8_t mac[HASH_SZ];
+        uint8_t cred_random[HASH_SZ];
+        uint8_t iv[16] = {0};
+        Aes aes;
+        Hmac hmac;
+
+        if (!params.hmac_secret_valid) { ret = CTAP2_ERR_INVALID_CBOR; goto ga_cleanup; }
+        if (pin_shared_secret(params.hs_platform_qx, params.hs_platform_qy, shared) != 0) { ret = CTAP2_ERR_PIN_AUTH_INVALID; goto ga_cleanup; }
+
+        if (wc_HmacInit(&hmac, NULL, 0) != 0) { ret = CTAP2_ERR_PIN_AUTH_INVALID; goto ga_cleanup; }
+        if (wc_HmacSetKey(&hmac, SHA256, shared, HASH_SZ) != 0) { wc_HmacFree(&hmac); ret = CTAP2_ERR_PIN_AUTH_INVALID; goto ga_cleanup; }
+        wc_HmacUpdate(&hmac, params.hs_salt_enc, params.hs_salt_enc_len);
+        wc_HmacFinal(&hmac, mac);
+        wc_HmacFree(&hmac);
+        if (memcmp(mac, params.hs_salt_auth, 16) != 0) { ret = CTAP2_ERR_PIN_AUTH_INVALID; goto ga_cleanup; }
+
+        if (wc_AesInit(&aes, NULL, INVALID_DEVID) != 0) { ret = CTAP2_ERR_PIN_AUTH_INVALID; goto ga_cleanup; }
+        if (wc_AesSetKey(&aes, shared + HASH_SZ, 32, iv, AES_DECRYPTION) != 0) { wc_AesFree(&aes); ret = CTAP2_ERR_PIN_AUTH_INVALID; goto ga_cleanup; }
+        if (wc_AesCbcDecrypt(&aes, salt_dec, params.hs_salt_enc, params.hs_salt_enc_len) != 0) { wc_AesFree(&aes); ret = CTAP2_ERR_PIN_AUTH_INVALID; goto ga_cleanup; }
+        wc_AesFree(&aes);
+
+        if (derive_cred_random(rpIdHash, params.cred_id, (uint16_t)params.cred_id_len, private, cred_random) != 0) { ret = CTAP2_ERR_INVALID_COMMAND; goto ga_cleanup; }
+        uint16_t salt_blocks = (uint16_t)(params.hs_salt_enc_len / 32);
+        for (uint16_t i = 0; i < salt_blocks; i++) {
+            if (wc_HmacInit(&hmac, NULL, 0) != 0) { ret = CTAP2_ERR_INVALID_COMMAND; goto ga_cleanup; }
+            if (wc_HmacSetKey(&hmac, SHA256, cred_random, HASH_SZ) != 0) { wc_HmacFree(&hmac); ret = CTAP2_ERR_INVALID_COMMAND; goto ga_cleanup; }
+            wc_HmacUpdate(&hmac, salt_dec + (i * 32), 32);
+            wc_HmacFinal(&hmac, hs_output + (i * 32));
+            wc_HmacFree(&hmac);
+        }
+
+        if (wc_AesInit(&aes, NULL, INVALID_DEVID) != 0) { ret = CTAP2_ERR_INVALID_COMMAND; goto ga_cleanup; }
+        memset(iv, 0, sizeof(iv));
+        if (wc_AesSetKey(&aes, shared + HASH_SZ, 32, iv, AES_ENCRYPTION) != 0) { wc_AesFree(&aes); ret = CTAP2_ERR_INVALID_COMMAND; goto ga_cleanup; }
+        if (wc_AesCbcEncrypt(&aes, salt_dec, hs_output, params.hs_salt_enc_len) != 0) { wc_AesFree(&aes); ret = CTAP2_ERR_INVALID_COMMAND; goto ga_cleanup; }
+        wc_AesFree(&aes);
+
+        struct cbor_buf ext = {.buf = ext_buf, .cap = sizeof(ext_buf), .len = 0};
+        if (cbor_start_map(&ext, 1) != 0) { ret = CTAP2_ERR_INVALID_COMMAND; goto ga_cleanup; }
+        if (cbor_put_text(&ext, "hmac-secret") != 0) { ret = CTAP2_ERR_INVALID_COMMAND; goto ga_cleanup; }
+        if (cbor_put_bytes(&ext, salt_dec, (uint16_t)params.hs_salt_enc_len) != 0) { ret = CTAP2_ERR_INVALID_COMMAND; goto ga_cleanup; }
+        ext_len = ext.len;
+        ForceZero(shared, sizeof(shared));
+        ForceZero(mac, sizeof(mac));
+        ForceZero(cred_random, sizeof(cred_random));
+        ForceZero(hs_output, sizeof(hs_output));
+        ForceZero(salt_dec, sizeof(salt_dec));
+    }
+
+    if (build_authdata_assert(rpIdHash, flags, device_get_counter(),
+                              ext_len ? ext_buf : NULL, ext_len,
+                              authData, sizeof(authData), &authDataLen) != 0) {
         ret = -1; goto ga_cleanup;
     }
 
@@ -1593,7 +1828,7 @@ ga_cleanup:
     wc_ecc_free(&user_ecc);
     ForceZero(private, sizeof(private));
     if (ret != 0) {
-        reply[0] = CTAP2_ERR_NO_CREDENTIALS;
+        reply[0] = (ret > 0) ? (uint8_t)ret : CTAP2_ERR_NO_CREDENTIALS;
         *reply_len = 1;
     }
     return 0;
