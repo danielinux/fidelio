@@ -47,9 +47,21 @@ not represent an important security risk in itself, as long as a first factor is
 password authentication).
 
 A rp2040 board running Fidelio will not store any credentials or traces that can be associated
-with any running server. The only two pieces of information stored in the target's FLASH memory
-are the device's master key, generated on first use, and counters keeping track
-of crypto operations, as mandated by the FIDO protocols.
+with any running server.
+
+**The master key is never stored.** It is reconstructed at every boot from the power-on state of
+a reserved block of SRAM — an SRAM PUF (Physically Unclonable Function) — using the wolfCrypt
+BCH(127,64,t=10) fuzzy extractor. What FLASH holds is only the *checkpoint*: non-secret helper
+data that corrects the bit errors in each boot's reading, plus a salt. Neither reveals the key.
+Dumping the FLASH of a Fidelio device therefore does not yield anything that can be used to
+impersonate it; the key exists only in RAM, only while the device is powered.
+
+The other information kept in FLASH is the counters tracking crypto operations, as mandated by
+the FIDO protocols, the FIDO2 PIN hash, and any resident credentials.
+
+Because the key is a property of the individual chip, a Fidelio image cannot be cloned onto
+another board to duplicate a key: flashing the same firmware elsewhere produces a different
+device.
 
 ### Hardware requirements
 
@@ -114,18 +126,53 @@ cp build/fidelio.uf2 /path/to/RPI-RP2
 ```
 
 
-### First run: generating the master key
+### First run: enrolling the SRAM PUF
 
-The first time the device is plugged in into the computer, it will randomly generate its master key.
-The master key will be then used, for the entire lifetime of the device, to generate
-keys for single FIDO services.
+The first time the device is plugged in, it enrolls its SRAM PUF. This takes two boots:
 
-Updating the Fidelio firmware to a newer version will not overwrite the master key,
-so the key will keep working with services that had been registered with the old
-firmware as well.
+1. **Enrollment.** The device measures the power-on state of its reserved SRAM block, computes
+   the helper data, writes it to FLASH as *provisional*, and then blinks the LED slowly
+   (0.7 s on, 0.3 s off) and stops. It does not enumerate over USB in this state.
+2. **Verification.** Unplug and plug the device back in. A real power cycle is required — a
+   reset would leave SRAM holding its previous contents and prove nothing. The device now
+   reconstructs the key from the helper data. If it matches, the checkpoint is marked
+   *committed* and the device starts normally. If it does not, the attempt is discarded and
+   enrollment starts over.
 
-On first boot the LED will stay on while the master key is generated; press the
-presence button once to acknowledge, then the device will reboot automatically.
+Nothing is registered against the device until it reaches the committed state, so a board that
+fails verification costs nothing.
+
+From then on, every boot reconstructs the same master key, which is used for the entire lifetime
+of the device to derive the keys for individual FIDO services.
+
+Updating the Fidelio firmware to a newer version does not touch the checkpoint, so the key keeps
+working with services registered under the old firmware.
+
+**If the LED blinks rapidly (0.1 s on, 0.1 s off) the device has failed to reconstruct its key**
+and will refuse to perform any cryptographic operation. This is deliberate: silently
+re-enrolling would mint a different master key and invalidate every credential without warning.
+See "Qualifying a board" below.
+
+### Qualifying a board
+
+The fuzzy extractor corrects at most 10 flipped bits per 127-bit codeword. A typical SRAM PUF
+sits comfortably inside that, but the margin narrows at temperature extremes and varies between
+chips. Before registering credentials against a new board, check it:
+
+```
+cmake -B build-diag -DPICO_COPY_TO_RAM=1 -DFAMILY=rp2040 \
+      -DPICO_SDK_PATH=/path/to/fidelio/pico-sdk -DFIDELIO_PUF_DIAG=ON
+cmake --build build-diag
+cp build-diag/fidelio.uf2 /path/to/RPI-RP2
+```
+
+The diagnostic prints a report on UART0 (GP0/GP1, 115200 8N1) instead of acting as an
+authenticator. Power-cycle it a dozen or so times, across the temperature range the key will
+actually see, and check that reconstruction succeeds every time and that the Hamming weight of
+the raw response stays near 50%. A response that is nearly all zeros or all ones means the
+region carries no entropy on that board.
+
+**Do not leave a diagnostic build flashed** — it is not an authenticator.
 
 ### Set the FIDO2 PIN
 
@@ -138,7 +185,17 @@ fido2-token -S /dev/hidrawX    # enter your chosen PIN when prompted
 Replace `/dev/hidrawX` with the device path listed by `fido2-token -L`. Press the
 presence button when prompted during this flow.
 
+### Factory reset
 
+Hold the presence button while plugging the device in and keep it held for 10 seconds. The LED
+turns yellow while the state is wiped: the PUF checkpoint, the operation counters, the PIN and
+any resident credentials. The device then reboots into enrollment and needs the two-boot
+sequence described above.
+
+This **permanently invalidates every credential** ever registered with the device. Re-enrollment
+draws a fresh salt, so the new master key is unrelated to the old one even though it comes from
+the same silicon. There is no way to recover the previous key — revoke the device at every
+service that still has it registered.
 
 ### Testing
 

@@ -22,7 +22,6 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include "pico/stdlib.h"
-#include "pico/multicore.h"
 #include "hardware/gpio.h"
 #include "hardware/adc.h"
 #include "bsp/board.h"
@@ -34,7 +33,8 @@
 #include "hardware/clocks.h"
 #include "fdo.h"
 #include "indicator.h"
-    
+#include "puf_sram.h"
+
 extern void u2f_init(void);
 extern void u2f_factory_reset(void);
 
@@ -75,13 +75,18 @@ void system_boot(void)
 {
     /* Setting system clock */
     set_sys_clock_48mhz();
-    
+
     /* Setting GPIOs for Button first, so we can gate startup on long-press */
     presence_button_init();
     factory_reset_startup_check();
 
     /* Setting GPIOs for Led + Button */
     indicator_init();
+
+    /* Reconstruct the master secret from the SRAM PUF. Does not return unless
+     * the secret is available.
+     */
+    puf_provision();
 
     /* Initializing U2F parser */
     u2f_init();
@@ -93,6 +98,11 @@ void system_boot(void)
 }
 
 int main(void) {
+    /* Must come first: the SRAM PUF response has to be copied out before any
+     * other code can disturb the reserved region.
+     */
+    puf_sram_snapshot();
+
     system_boot();
 
     /* Main loop: transfer control to USB */

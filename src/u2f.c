@@ -39,6 +39,7 @@
 #include "pins.h"
 #include "indicator.h"
 #include "fdo.h"
+#include "puf_sram.h"
 
 
 #define PUBKEY_SZ 65
@@ -56,15 +57,14 @@ extern void ForceZero(void* mem, word32 len);
 
 #define FLASH_CTR_ADDR0_OFF 0x70000
 #define FLASH_CTR_ADDR1_OFF 0x71000
-#define FLASH_MKEY_OFF      0x72000
-#define FLASH_MKEY ((uint32_t *)(XIP_BASE + FLASH_MKEY_OFF))
+/* 0x72000 holds the SRAM PUF checkpoint; see src/puf_sram.c. It used to hold
+ * the master key itself, which is no longer stored anywhere.
+ */
 #define FLASH_CTR0 *((uint32_t *)(XIP_BASE + FLASH_CTR_ADDR0_OFF))
 #define FLASH_CTR1 *((uint32_t *)(XIP_BASE + FLASH_CTR_ADDR1_OFF))
 
-static uint32_t master_magic = 0xF1D091C0;
-
-static uint8_t *device_secret = (uint8_t *)(FLASH_MKEY + 4);
-static uint32_t *magic_check = (uint32_t *)FLASH_MKEY;
+/* Reconstructed from the SRAM PUF at boot, never written to flash. */
+#define device_secret (puf_master_secret())
 
 static uint32_t U2F_Counter = 0;
 
@@ -74,35 +74,6 @@ static void write_counter_page(uint32_t flash_off, uint32_t value)
     memcpy(page_buf, (const void *)(XIP_BASE + flash_off), FLASH_PAGE_SIZE);
     memcpy(page_buf, &value, 4);
     flash_range_program(flash_off, page_buf, FLASH_PAGE_SIZE);
-}
-
-static void write_master_page(uint32_t flash_off, const uint8_t *key, uint32_t magic)
-{
-    uint8_t page_buf[FLASH_PAGE_SIZE];
-    memcpy(page_buf, (const void *)(XIP_BASE + flash_off), FLASH_PAGE_SIZE);
-    memcpy(page_buf, &magic, 4);
-    memcpy(page_buf + 4, key, 32);
-    flash_range_program(flash_off, page_buf, FLASH_PAGE_SIZE);
-}
-
-/* Run flash ops from RAM to avoid XIP stalls */
-static void __not_in_flash_func(flash_master_keygen)(void)
-{
-    WC_RNG rng;
-    uint8_t mkey_buffer[4 + 32];
-    /* Keep LED off during keygen; turn it on once ready for acknowledgment */
-    indicator_set_idle();
-    wc_InitRng(&rng);
-    wc_RNG_GenerateBlock(&rng, mkey_buffer, 32);
-    flash_range_erase(FLASH_MKEY_OFF, FLASH_SECTOR_SIZE);
-    flash_range_erase(FLASH_CTR_ADDR0_OFF, FLASH_SECTOR_SIZE);
-    flash_range_erase(FLASH_CTR_ADDR1_OFF, FLASH_SECTOR_SIZE);
-    write_counter_page(FLASH_CTR_ADDR0_OFF, U2F_Counter);
-    write_master_page(FLASH_MKEY_OFF, mkey_buffer, master_magic);
-    /* Signal ready and wait for presence press to confirm first-boot provisioning */
-    indicator_wait_for_button(0x20, 0, 0);
-    watchdog_reboot(0, 0, 0);
-    while (1) { tight_loop_contents(); }
 }
 
 static void __not_in_flash_func(U2F_Counter_up)(void)
@@ -136,26 +107,30 @@ static uint32_t U2F_Counter_load(void)
 
 void u2f_init(void)
 {
-    if (*magic_check != master_magic) {
-        flash_master_keygen();
-        U2F_Counter = 0;
-    } else {
-        U2F_Counter = U2F_Counter_load();
-    }
+    /* The master secret is already reconstructed by puf_provision(), which
+     * runs before this and does not return unless it succeeded.
+     */
+    U2F_Counter = U2F_Counter_load();
 }
 
-void u2f_factory_reset(void)
+void __not_in_flash_func(u2f_factory_reset)(void)
 {
     /* Turn LED yellow while wiping state */
     indicator_set(0x20, 0x20, 0);
-    flash_range_erase(FLASH_MKEY_OFF, FLASH_SECTOR_SIZE);
+    /* Dropping the PUF checkpoint is what actually invalidates credentials.
+     * The next boot enrolls again and draws a fresh salt, so the new master
+     * secret is unrelated to the old one even though the SRAM response is
+     * replayed unchanged across the warm reset below.
+     */
+    puf_factory_erase();
     flash_range_erase(FLASH_CTR_ADDR0_OFF, FLASH_SECTOR_SIZE);
     flash_range_erase(FLASH_CTR_ADDR1_OFF, FLASH_SECTOR_SIZE);
     ctap2_reset_state();
     fdo_reset();
     U2F_Counter = 0;
     indicator_set_idle();
-    flash_master_keygen();
+    watchdog_reboot(0, 0, 0);
+    while (1) { tight_loop_contents(); }
 }
 
 

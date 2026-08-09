@@ -33,6 +33,11 @@
 #define HAVE_SHA256
 #define HAVE_HASHDRBG
 #define HAVE_HKDF
+
+/* SRAM PUF root of trust: the device master secret is reconstructed at boot
+ * instead of being stored in flash. See src/puf_sram.c.
+ */
+#define WOLFSSL_PUF
 extern int custom_random_seed(unsigned char* output, unsigned int sz);
 #define CUSTOM_RAND_GENERATE_SEED custom_random_seed
 
