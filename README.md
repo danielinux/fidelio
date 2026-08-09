@@ -291,6 +291,29 @@ not a placement problem, which is why the answer is a retry path rather than a b
 **Do not leave a diagnostic build flashed** — it is not an authenticator, and it writes to the
 last flash sector.
 
+### Discoverable credentials (passkeys)
+
+Fidelio supports discoverable credentials, so a relying party can authenticate
+you without first telling the device which credential to use. These are the
+only credentials that require storage: an ordinary credential ID carries
+everything needed to re-derive its key, but a discoverable one has to be found
+from the site alone.
+
+That record -- which services you hold accounts with, and under which user IDs
+-- is exactly what a stolen key should not reveal. It is therefore sealed with
+ChaCha20-Poly1305 under a key derived from the device master key, using a fresh
+key on every update. Since the master key is itself never stored and exists
+only while the device is powered, a FLASH dump yields ciphertext and nothing
+else.
+
+Fidelio is a personal authenticator holding a single identity, so it keeps **at
+most one discoverable credential per site**, and registering a second one for a
+site replaces the first. If you need two accounts on the same service, use
+non-discoverable credentials for them: those are unlimited, since the relying
+party names which credential it wants and nothing has to be stored.
+
+The vault holds 16 sites.
+
 ### Set the FIDO2 PIN
 
 After flashing, set the authenticator PIN:

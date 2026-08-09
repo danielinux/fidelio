@@ -24,6 +24,11 @@
  * relying party sends no credential ID at all -- the authenticator must find
  * the credential from the rpId alone, and hand back the user handle.
  *
+ * Fidelio holds one identity, so there is at most one discoverable
+ * credential per relying party; registering another for the same site
+ * replaces it. That keeps every assertion at numberOfCredentials = 1 and is
+ * why authenticatorGetNextAssertion is not implemented.
+ *
  * That record set is exactly what an attacker wants from a stolen key: which
  * services the owner has accounts with, and under what user IDs. Storing it in
  * the clear would give away by inspection what the SRAM PUF work exists to

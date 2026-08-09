@@ -194,17 +194,29 @@ int cred_store_put(const struct cred_record *rec)
     if (cred_store_load() != 0)
         return -1;
 
-    /* One credential per (relying party, user): re-registering the same
-     * account replaces it rather than accumulating duplicates. */
+    /* One discoverable credential per relying party, replacing any previous
+     * one for that site.
+     *
+     * Fidelio is a personal authenticator holding a single identity, so
+     * "another account on the same site" is not a supported case. Enforcing
+     * that here keeps numberOfCredentials at one for every assertion, which
+     * is what makes authenticatorGetNextAssertion (0x08) unnecessary rather
+     * than merely unimplemented: the platform only issues it when the
+     * authenticator reports more than one credential.
+     *
+     * The trade-off is deliberate and worth knowing: registering a second
+     * account at a site that already has a credential replaces the first,
+     * and access to the earlier account is lost. Non-discoverable
+     * credentials are unaffected -- the relying party names which one it
+     * wants in the allowList, so any number may coexist.
+     */
     for (i = 0; i < CRED_STORE_SLOTS; i++) {
         if (slots[i].cred_id_len == 0) {
             if (free_slot < 0)
                 free_slot = (int)i;
             continue;
         }
-        if (memcmp(slots[i].rp_id_hash, rec->rp_id_hash, 32) == 0 &&
-            slots[i].user_id_len == rec->user_id_len &&
-            memcmp(slots[i].user_id, rec->user_id, rec->user_id_len) == 0) {
+        if (memcmp(slots[i].rp_id_hash, rec->rp_id_hash, 32) == 0) {
             free_slot = (int)i;
             break;
         }
