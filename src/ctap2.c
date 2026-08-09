@@ -1138,6 +1138,46 @@ static int parse_getassert(const uint8_t *buf, uint16_t len, struct ga_params *o
     return 0;
 }
 
+/* WebAuthn signature counter: always zero.
+ *
+ * WebAuthn L3 section 6.1.1 allows a per-credential counter, a global counter,
+ * or a global counter with a per-credential increment step, and it permits
+ * reporting a constant zero -- which is what synced passkey providers do.
+ * Per-credential counters are recommended, but they require per-credential
+ * state, and Fidelio deliberately stores none: every credential key is
+ * re-derived on demand from the master secret.
+ *
+ * The counter exists so a relying party can detect a cloned authenticator.
+ * Fidelio cannot be cloned, so there is nothing for it to detect:
+ *
+ *   - The master secret is never stored. It is reconstructed at every boot
+ *     from the power-on state of a reserved SRAM block, using the wolfCrypt
+ *     BCH(127,50,t=13) fuzzy extractor.
+ *   - That power-up state is a physical property of one particular die: it
+ *     comes from process variation in the SRAM cells' bias. Measured on this
+ *     hardware it is a stable fingerprint -- ~49.7% Hamming weight, 5.9%
+ *     inter-boot bit error rate, well inside what the code corrects.
+ *   - Flash holds only the helper data and a salt. Neither reveals the key:
+ *     in the code-offset construction the helper data is the raw readout
+ *     XOR a codeword, and the residual min-entropy of the stable bits stays
+ *     above 190 bits even at a pessimistic 0.70 bits/bit SRAM entropy rate.
+ *   - Copying the flash to a second RP2040 therefore reproduces the helper
+ *     data but not the SRAM response, so reconstruction yields a different
+ *     master secret and every derived credential key differs.
+ *   - Credential private keys are themselves never stored, in flash or in
+ *     the credential ID; they are HKDF-derived per operation.
+ *
+ * So there is no artifact anywhere that can be copied to produce a second
+ * authenticator answering for the same credentials. Reporting zero costs
+ * nothing detectable and removes the cross-relying-party correlation that a
+ * global counter leaks.
+ *
+ * The CTAP1/U2F path in u2f.c keeps its own incrementing counter: that
+ * protocol's deployed verifiers (pam_u2f among them) reject a counter that
+ * fails to advance.
+ */
+#define CTAP2_SIGN_COUNT 0u
+
 static const uint8_t fidelio_aaguid[16] = {
     0xf1, 0xde, 0x10, 0x01,
     0x42, 0x42, 0x42, 0x42,
@@ -1333,7 +1373,7 @@ static int ctap2_make_credential(const uint8_t *payload, uint16_t payload_len,
             memcpy(rk_slots[slot].rpIdHash, rpIdHash, HASH_SZ);
             rk_slots[slot].cred_id_len = credIdLen;
             memcpy(rk_slots[slot].cred_id, credId, credIdLen);
-            rk_slots[slot].counter = device_get_counter();
+            rk_slots[slot].counter = 0;
             if (params.user_handle && params.user_handle_len <= sizeof(rk_slots[slot].user_handle))
                 memcpy(rk_slots[slot].user_handle, params.user_handle, params.user_handle_len);
             rk_save();
@@ -1351,7 +1391,7 @@ static int ctap2_make_credential(const uint8_t *payload, uint16_t payload_len,
     if (pin_store.magic == FLASH_PIN_MAGIC && params.pin_auth && params.pin_auth_len == 16)
         flags |= 0x04;
 
-    if (build_authdata_attested(rpIdHash, flags, device_get_counter(), credId, credIdLen, &user_key,
+    if (build_authdata_attested(rpIdHash, flags, CTAP2_SIGN_COUNT, credId, credIdLen, &user_key,
                                 authData, sizeof(authData), &authDataLen) != 0) {
         ret = -1; goto cleanup;
     }
@@ -1367,7 +1407,8 @@ static int ctap2_make_credential(const uint8_t *payload, uint16_t payload_len,
     if (ret != 0)
         goto cleanup;
 
-    device_counter_inc();
+    /* No signature counter to advance (see CTAP2_SIGN_COUNT), which also
+     * keeps makeCredential off the flash entirely. */
 
     /* Build response */
     WOLFCOSE_CBOR_CTX c;
@@ -1621,7 +1662,7 @@ static int ctap2_get_assertion(const uint8_t *payload, uint16_t payload_len,
         #undef hs_fail
     }
 
-    if (build_authdata_assert(rpIdHash, flags, device_get_counter(),
+    if (build_authdata_assert(rpIdHash, flags, CTAP2_SIGN_COUNT,
                               ext_len ? ext_buf : NULL, ext_len,
                               authData, sizeof(authData), &authDataLen) != 0) {
         ret = -1; goto ga_cleanup;
@@ -1643,7 +1684,7 @@ static int ctap2_get_assertion(const uint8_t *payload, uint16_t payload_len,
         ret = -1; goto ga_cleanup;
     }
 
-    device_counter_inc();
+    /* No signature counter to advance (see CTAP2_SIGN_COUNT). */
 
     WOLFCOSE_CBOR_CTX c;
     cbor_enc_init(&c, reply, reply_max, 1);

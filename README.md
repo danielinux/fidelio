@@ -62,7 +62,20 @@ the FIDO protocols, the FIDO2 PIN hash, and any resident credentials.
 
 Because the key is a property of the individual chip, a Fidelio image cannot be cloned onto
 another board to duplicate a key: flashing the same firmware elsewhere produces a different
-device.
+device. Concretely, copying the FLASH to a second RP2040 reproduces the helper data but not the
+SRAM response it corrects, so reconstruction yields a different master key and every credential
+derived from it differs. The credential private keys are themselves never stored anywhere --
+not in FLASH, not in the credential ID -- but re-derived per operation. There is therefore no
+artifact that can be copied to produce a second authenticator answering for the same
+credentials.
+
+That is also why **Fidelio reports a WebAuthn signature counter of zero.** The counter exists so
+a relying party can detect a cloned authenticator; since cloning is prevented by construction,
+there is nothing for it to detect. WebAuthn permits a constant zero -- synced passkey providers
+report zero on every assertion -- and it avoids the cross-relying-party correlation that a
+single device-wide counter leaks, without spending the per-credential storage that a private
+counter would need. The legacy CTAP1/U2F path keeps its own incrementing counter, because
+deployed U2F verifiers such as `pam_u2f` reject one that fails to advance.
 
 ### Hardware requirements
 
