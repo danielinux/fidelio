@@ -26,20 +26,21 @@
 #include "wolfssl/wolfcrypt/sha256.h"
 #include "wolfssl/wolfcrypt/misc.h"
 #include "puf_sram.h"
+#include "pins.h"
 
+/* Which ADC channels are free to float on this board. Channels wired to
+ * something else (the presence button, typically) are excluded by the board
+ * definition in pins.h, because adc_gpio_init() would steal the pin from its
+ * digital function.
+ */
+static const uint8_t adc_channels[] = FIDELIO_ADC_CHANNELS;
 
-#define IN3_PIN 29
-#define IN0_PIN 28
-#define IN1_PIN 27
-#define IN2_PIN 26
+#define ADC_NUM_CHANNELS (sizeof(adc_channels) / sizeof(adc_channels[0]))
 
-const uint32_t IN[4] = {IN0_PIN, IN1_PIN, IN2_PIN, IN3_PIN};
 static int adc_initialized = 0;
 
-const int in_a[8] = { 0, 1, 2, 3, 1, 3, 0, 2 };
-
 /* Collect sz bytes of raw ADC noise: eight 3-bit samples per 3 output bytes,
- * rotating across the four floating inputs.
+ * rotating across the board's floating inputs.
  */
 static void adc_noise(unsigned char *output, unsigned int sz)
 {
@@ -49,16 +50,16 @@ static void adc_noise(unsigned char *output, unsigned int sz)
 
     if (!adc_initialized) {
         adc_init();
-        for (i = 0; i < 4; i++) {
-            adc_gpio_init(IN[i]);
+        for (i = 0; i < ADC_NUM_CHANNELS; i++) {
+            adc_gpio_init(FIDELIO_ADC_CHANNEL_GPIO(adc_channels[i]));
         }
         adc_initialized = 1;
         sleep_ms(10);
     }
 
-    /* Perform eight 3-bit samples with sources 0-1-2-4 */
+    /* Eight 3-bit samples, round-robin across the available channels */
     for (i = 0; rd < sz; i = (i + 1) % 8) {
-        adc_select_input(in_a[i]);
+        adc_select_input(adc_channels[i % ADC_NUM_CHANNELS]);
 
         /* Read the least significant 3 bits from the ADC */
         result = (result << 3) | (adc_read() & 0x00000007);
