@@ -32,6 +32,7 @@
 #define TFM_TIMING_RESISTANT
 #define HAVE_SHA256
 #define HAVE_HASHDRBG
+#define HAVE_HKDF
 extern int custom_random_seed(unsigned char* output, unsigned int sz);
 #define CUSTOM_RAND_GENERATE_SEED custom_random_seed
 
@@ -57,14 +58,13 @@ extern int custom_random_seed(unsigned char* output, unsigned int sz);
 #define NO_INLINE
 
 
-#define WOLFSSL_SP
+/* SP math: WOLFSSL_SP_MATH selects the reduced implementation that only
+ * covers the SP-accelerated curves (P-256 here). It is mutually exclusive
+ * with WOLFSSL_SP_MATH_ALL, which wolfSSL enforces since v5.9.
+ */
 #define WOLFSSL_SP_SMALL
-#define WOLFSSL_SP_MATH
-#define WOLFSSL_SP_MATH_ALL
 //#define WOLFSSL_SP_ARM_ARCH 4
 #define WOLFSSL_SP_ARM_THUMB_ASM
-#define SP_WORD_SIZE 32
-#define SINGLE_THREADED
 
 /* Disables - For minimum wolfCrypt build */
 #define NO_CMAC
