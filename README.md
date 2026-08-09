@@ -51,7 +51,7 @@ with any running server.
 
 **The master key is never stored.** It is reconstructed at every boot from the power-on state of
 a reserved block of SRAM — an SRAM PUF (Physically Unclonable Function) — using the wolfCrypt
-BCH(127,64,t=10) fuzzy extractor. What FLASH holds is only the *checkpoint*: non-secret helper
+BCH(127,50,t=13) fuzzy extractor. What FLASH holds is only the *checkpoint*: non-secret helper
 data that corrects the bit errors in each boot's reading, plus a salt. Neither reveals the key.
 Dumping the FLASH of a Fidelio device therefore does not yield anything that can be used to
 impersonate it; the key exists only in RAM, only while the device is powered.
@@ -131,8 +131,8 @@ cp build/fidelio.uf2 /path/to/RPI-RP2
 The first time the device is plugged in, it enrolls its SRAM PUF. This takes two boots:
 
 1. **Enrollment.** The device measures the power-on state of its reserved SRAM block, computes
-   the helper data, writes it to FLASH as *provisional*, and then blinks the LED slowly
-   (0.7 s on, 0.3 s off) and stops. It does not enumerate over USB in this state.
+   the helper data, writes it to FLASH as *provisional*, and then blinks halt code 1 (see
+   below) and stops. It does not enumerate over USB in this state.
 2. **Verification.** Unplug and plug the device back in. A real power cycle is required — a
    reset would leave SRAM holding its previous contents and prove nothing. The device now
    reconstructs the key from the helper data. If it matches, the checkpoint is marked
@@ -146,18 +146,38 @@ From then on, every boot reconstructs the same master key, which is used for the
 of the device to derive the keys for individual FIDO services.
 
 Updating the Fidelio firmware to a newer version does not touch the checkpoint, so the key keeps
-working with services registered under the old firmware.
+working with services registered under the old firmware — **unless the update changes the PUF
+profile** (`WC_PUF_BCH_T` or `WC_PUF_NUM_CODEWORDS` in `src/user_settings.h`). Those values are
+recorded in the checkpoint and checked on every boot, so a mismatch is reported as halt code 3
+rather than silently deriving a different key.
 
-**If the LED blinks rapidly (0.1 s on, 0.1 s off) the device has failed to reconstruct its key**
-and will refuse to perform any cryptographic operation. This is deliberate: silently
-re-enrolling would mint a different master key and invalidate every credential without warning.
-See "Qualifying a board" below.
+### Halt codes
+
+When Fidelio cannot proceed it blinks the LED a fixed number of times, pauses, and repeats:
+
+| Flashes | Meaning | What to do |
+|---|---|---|
+| 1 | Enrolled, awaiting verification | Unplug and replug (a reset is not enough) |
+| 2 | Reconstruction failed | Unplug and replug to retry |
+| 3 | Build or memory-map fault | Firmware problem; see below |
+
+**Code 2 is usually transient.** It means this boot's reading of the SRAM drifted further from
+the enrolled one than the error-correcting code could repair. The next power-on is an
+independent draw and will very likely succeed. Fidelio deliberately does not retry by itself: a
+warm reset would replay the identical SRAM contents and fail identically, and re-enrolling would
+"fix" the boot by silently minting a different master key and invalidating every credential. If
+code 2 repeats across several power cycles, the board is too noisy for the configured profile —
+run the diagnostic below.
+
+**Code 3 is not retryable.** It means the firmware and the wolfSSL build disagree about the PUF
+profile, or something in the image was linked on top of the reserved SRAM region.
 
 ### Qualifying a board
 
-The fuzzy extractor corrects at most 10 flipped bits per 127-bit codeword. A typical SRAM PUF
-sits comfortably inside that, but the margin narrows at temperature extremes and varies between
-chips. Before registering credentials against a new board, check it:
+The fuzzy extractor corrects at most 13 flipped bits per 127-bit codeword, and reconstruction
+fails if any one of the 16 codewords exceeds that. A typical SRAM PUF sits comfortably inside
+the limit, but the margin narrows at temperature extremes and varies between chips. Before
+registering credentials against a new board, check it:
 
 ```
 cmake -B build-diag -DPICO_COPY_TO_RAM=1 -DFAMILY=rp2040 \

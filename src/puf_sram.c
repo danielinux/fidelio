@@ -47,6 +47,13 @@ extern void ForceZero(void* mem, word32 len);
 #define PUF_MAGIC_PROVISIONAL 0x50554630u /* 'PUF0' */
 #define PUF_MAGIC_COMMITTED   0x50554631u /* 'PUF1' */
 
+/* Halt codes, blinked as N short flashes followed by a pause. The stock Pico
+ * has a single LED, so a countable pattern carries further than a colour.
+ */
+#define PUF_CODE_ENROLLED     1 /* enrolled, power-cycle to verify */
+#define PUF_CODE_RECONSTRUCT  2 /* reconstruction failed, power-cycle to retry */
+#define PUF_CODE_CONFIG       3 /* build or memory-map fault, not retryable */
+
 /* HKDF info: a fixed label binding the key to this use, followed by a salt
  * drawn once per enrollment.
  *
@@ -60,7 +67,7 @@ extern void ForceZero(void* mem, word32 len);
 #define PUF_SALT_SZ 32
 static const char puf_key_label[] = "fidelio-master-secret";
 
-/* The reserved SRAM response. Placed by src/puf_sram.ld at the base of
+/* The reserved SRAM response. Placed by src/memmap_fidelio.ld at the base of
  * SCRATCH_X in a NOLOAD section: never initialised, never written.
  */
 static volatile const uint8_t puf_region[WC_PUF_RAW_BYTES]
@@ -82,8 +89,15 @@ static uint8_t master_secret[WC_PUF_KEY_SZ];
 static bool snapshot_taken = false;
 static bool secret_valid = false;
 
+/* profileId records the BCH profile, codeword count, hash and helper layout
+ * the helper data was enrolled with. wc_PufReconstructEx() refuses to run
+ * against a mismatch, which would otherwise decode to a silently wrong key --
+ * a firmware update that changed WC_PUF_BCH_T would quietly invalidate every
+ * credential with no error anywhere.
+ */
 struct puf_checkpoint {
     uint32_t magic;
+    uint32_t profileId;
     uint8_t salt[PUF_SALT_SZ];
     uint8_t helper[WC_PUF_HELPER_BYTES];
 };
@@ -113,19 +127,20 @@ const uint8_t *puf_master_secret(void)
     return secret_valid ? master_secret : NULL;
 }
 
-/* Blink forever. The stock Pico has a single LED, so the pattern rather than
- * the colour is what distinguishes the halt states. The caller has already
- * run indicator_init(); re-running it would add a second copy of the WS2812
- * PIO program on RGB boards.
+/* Blink a halt code forever: `code` short flashes, then a long pause. The
+ * caller has already run indicator_init(); re-running it would add a second
+ * copy of the WS2812 PIO program on RGB boards.
  */
-static void puf_halt_blinking(uint32_t on_ms, uint32_t off_ms,
-                              uint16_t r, uint16_t g, uint16_t b)
+static void puf_halt(int code, uint16_t r, uint16_t g, uint16_t b)
 {
     while (1) {
-        indicator_set(r, g, b);
-        sleep_ms(on_ms);
-        indicator_set_idle();
-        sleep_ms(off_ms);
+        for (int i = 0; i < code; i++) {
+            indicator_set(r, g, b);
+            sleep_ms(180);
+            indicator_set_idle();
+            sleep_ms(220);
+        }
+        sleep_ms(1400);
     }
 }
 
@@ -138,6 +153,7 @@ static void __not_in_flash_func(puf_write_checkpoint)(uint32_t magic,
 
     memset(page, 0xFF, sizeof(page));
     cp->magic = magic;
+    cp->profileId = (uint32_t)WC_PUF_PROFILE_ID;
     memcpy(cp->salt, salt, PUF_SALT_SZ);
     memcpy(cp->helper, helper, WC_PUF_HELPER_BYTES);
     flash_range_erase(FLASH_PUF_OFF, FLASH_SECTOR_SIZE);
@@ -183,30 +199,40 @@ static int puf_make_salt(uint8_t *salt)
 #ifdef FIDELIO_PUF_DIAG
 #include <stdio.h>
 
-/* Bring-up diagnostic. BCH(127,64,t=10) corrects at most 10 flipped bits per
- * 127-bit codeword. Typical SRAM PUF bit error rates leave usable but not
- * generous margin, and the margin shrinks at temperature extremes, so a board
- * should be qualified before any credential is registered against it.
+/* Bring-up diagnostic. Reconstruction fails if any single 127-bit codeword
+ * carries more than WC_PUF_BCH_T flipped bits, and the margin shrinks at
+ * temperature extremes and varies between chips, so a board should be
+ * qualified before any credential is registered against it.
  *
- * Build with -DFIDELIO_PUF_DIAG, run over ~20 power cycles across the
- * temperature range the key will see, and watch the worst-case column. A
- * board whose worst codeword approaches 10 is not a safe PUF host.
+ * Build with -DFIDELIO_PUF_DIAG=ON, run over a dozen or more power cycles
+ * across the temperature range the key will see, and confirm reconstruction
+ * succeeds every time.
  */
 void puf_diag_report(void)
 {
     const struct puf_checkpoint *cp = (const struct puf_checkpoint *)FLASH_PUF_ADDR;
     wc_PufCtx ctx;
+    int m, n, k, t, ncw;
     uint32_t i;
 
     stdio_init_all();
-    sleep_ms(3000); /* let the host attach to the CDC port */
+    sleep_ms(3000); /* let the host attach to the UART */
 
     puf_sram_snapshot();
 
+    wc_PufGetParams(&m, &n, &k, &t, &ncw);
     printf("\n=== fidelio SRAM PUF diagnostic ===\n");
-    printf("region   : %p .. %p\n", (void *)__puf_sram_start__,
-           (void *)__puf_sram_end__);
-    printf("checkpoint magic: %08lx\n", (unsigned long)cp->magic);
+    printf("profile  : BCH(%d,%d,t=%d) over GF(2^%d), %d codewords\n",
+           n, k, t, m, ncw);
+    printf("profileId: app %08lx / lib %08lx%s\n",
+           (unsigned long)WC_PUF_PROFILE_ID,
+           (unsigned long)wc_PufGetProfileId(),
+           (wc_PufGetProfileId() == (word32)WC_PUF_PROFILE_ID) ? "" : "  MISMATCH");
+    printf("region   : %p .. %p (%u bytes needed)\n",
+           (void *)__puf_sram_start__, (void *)__puf_sram_end__,
+           (unsigned)WC_PUF_RAW_BYTES);
+    printf("checkpoint magic %08lx profileId %08lx\n",
+           (unsigned long)cp->magic, (unsigned long)cp->profileId);
 
     printf("raw response:\n");
     for (i = 0; i < WC_PUF_RAW_BYTES; i++) {
@@ -226,7 +252,8 @@ void puf_diag_report(void)
             while (v) { ones += (v & 1u); v >>= 1; }
         }
         printf("hamming weight: %lu/%u bits (%lu%%)\n", (unsigned long)ones,
-               WC_PUF_RAW_BITS, (unsigned long)(ones * 100u / WC_PUF_RAW_BITS));
+               (unsigned)WC_PUF_RAW_BITS,
+               (unsigned long)(ones * 100u / WC_PUF_RAW_BITS));
     }
 
     if (cp->magic != PUF_MAGIC_COMMITTED && cp->magic != PUF_MAGIC_PROVISIONAL) {
@@ -235,18 +262,17 @@ void puf_diag_report(void)
         while (1) { tight_loop_contents(); }
     }
 
-    /* Per-codeword error count against the enrolled bits. This is the number
-     * BCH has to correct on this boot; t = 10 is the ceiling.
-     */
     if (wc_PufInit(&ctx) != 0 ||
         wc_PufReadSram(&ctx, puf_raw, sizeof(puf_raw)) != 0) {
         printf("puf init failed\n");
         while (1) { tight_loop_contents(); }
     }
 
-    if (wc_PufReconstruct(&ctx, cp->helper, WC_PUF_HELPER_BYTES) != 0) {
-        printf("RECONSTRUCT FAILED: at least one codeword exceeded t=10.\n"
-               "This board would refuse to boot in normal firmware.\n");
+    if (wc_PufReconstructEx(&ctx, cp->helper, WC_PUF_HELPER_BYTES,
+                            cp->profileId) != 0) {
+        printf("RECONSTRUCT FAILED: at least one codeword exceeded t=%d.\n"
+               "Normal firmware would ask for a power cycle and retry.\n"
+               "If this repeats, the board is too noisy for this profile.\n", t);
     } else {
         uint8_t id[WC_PUF_ID_SZ];
         printf("reconstruct OK\n");
@@ -265,13 +291,21 @@ void puf_diag_report(void)
 
 int puf_provision(void)
 {
-#ifdef FIDELIO_PUF_DIAG
-    puf_diag_report(); /* does not return */
-#endif
     const struct puf_checkpoint *cp = (const struct puf_checkpoint *)FLASH_PUF_ADDR;
     wc_PufCtx ctx;
     uint32_t magic;
     int ret;
+
+#ifdef FIDELIO_PUF_DIAG
+    puf_diag_report(); /* does not return */
+#endif
+
+    /* The library and this translation unit must agree on the PUF profile.
+     * WC_PUF_PROFILE_ID expands from the macros visible here, so a wolfSSL
+     * built with different settings would size buffers differently.
+     */
+    if (wc_PufGetProfileId() != (word32)WC_PUF_PROFILE_ID)
+        puf_halt(PUF_CODE_CONFIG, 0x20, 0, 0);
 
     /* If anything else has been placed over the response region it was
      * overwritten before we ever read it. Refuse rather than derive a wrong
@@ -280,33 +314,45 @@ int puf_provision(void)
     if ((uint32_t)(__puf_sram_end__ - __puf_sram_start__) < WC_PUF_RAW_BYTES ||
         __scratch_x_start__ < __puf_sram_end__ ||
         __StackOneBottom < __puf_sram_end__)
-        puf_halt_blinking(100, 100, 0x20, 0, 0);
+        puf_halt(PUF_CODE_CONFIG, 0x20, 0, 0);
 
     puf_sram_snapshot();
 
     if (wc_PufInit(&ctx) != 0)
-        puf_halt_blinking(100, 100, 0x20, 0, 0);
+        puf_halt(PUF_CODE_CONFIG, 0x20, 0, 0);
     if (wc_PufReadSram(&ctx, puf_raw, sizeof(puf_raw)) != 0)
-        puf_halt_blinking(100, 100, 0x20, 0, 0);
+        puf_halt(PUF_CODE_CONFIG, 0x20, 0, 0);
 
     magic = cp->magic;
 
     if (magic == PUF_MAGIC_COMMITTED) {
-        /* Normal boot. A failure here means the response drifted beyond what
-         * BCH(127,64,t=10) can correct. Re-enrolling would silently mint a
-         * different master secret and destroy every registered credential,
-         * so stop instead.
-         */
+        /* Normal boot. */
         uint8_t salt[PUF_SALT_SZ];
         memcpy(salt, cp->salt, sizeof(salt));
-        if (wc_PufReconstruct(&ctx, cp->helper, WC_PUF_HELPER_BYTES) != 0) {
+
+        if (wc_PufReconstructEx(&ctx, cp->helper, WC_PUF_HELPER_BYTES,
+                                cp->profileId) != 0) {
             wc_PufZeroize(&ctx);
-            puf_halt_blinking(100, 100, 0x20, 0, 0);
+            /* Reconstruction failure is usually transient: this boot's SRAM
+             * reading drifted further from the enrolled one than the code can
+             * correct. The next power-on is an independent draw and will very
+             * likely succeed, so ask for one rather than declaring the device
+             * dead.
+             *
+             * Deliberately no automatic retry and no flash write here. A warm
+             * reset would replay the identical SRAM contents and fail again
+             * identically, and erasing this sector to record an attempt would
+             * put the only copy of the helper data at risk for no benefit.
+             * Re-enrolling would "fix" the boot by silently minting a
+             * different master secret and invalidating every credential, so
+             * that is never done automatically either.
+             */
+            puf_halt(PUF_CODE_RECONSTRUCT, 0x20, 0, 0);
         }
         ret = puf_derive(&ctx, salt);
         wc_PufZeroize(&ctx);
         if (ret != 0)
-            puf_halt_blinking(100, 100, 0x20, 0, 0);
+            puf_halt(PUF_CODE_CONFIG, 0x20, 0, 0);
         return 0;
     }
 
@@ -316,7 +362,8 @@ int puf_provision(void)
          * The salt is carried over unchanged, so the secret proven here is
          * the one the device will keep using.
          */
-        if (wc_PufReconstruct(&ctx, cp->helper, WC_PUF_HELPER_BYTES) == 0) {
+        if (wc_PufReconstructEx(&ctx, cp->helper, WC_PUF_HELPER_BYTES,
+                                cp->profileId) == 0) {
             uint8_t salt[PUF_SALT_SZ];
             uint8_t helper[WC_PUF_HELPER_BYTES];
             memcpy(salt, cp->salt, sizeof(salt));
@@ -324,15 +371,15 @@ int puf_provision(void)
             puf_write_checkpoint(PUF_MAGIC_COMMITTED, salt, helper);
             ForceZero(helper, sizeof(helper));
             ret = puf_derive(&ctx, salt);
-            ForceZero(salt, sizeof(salt));
             wc_PufZeroize(&ctx);
             if (ret != 0)
-                puf_halt_blinking(100, 100, 0x20, 0, 0);
+                puf_halt(PUF_CODE_CONFIG, 0x20, 0, 0);
             return 0;
         }
         /* Verification failed. Nothing has been registered against this
          * device yet, so discarding the attempt and enrolling again costs
-         * nothing.
+         * nothing -- and enrolling from this boot's reading may well land on
+         * a more representative response than the last one did.
          */
         puf_factory_erase();
     }
@@ -340,16 +387,22 @@ int puf_provision(void)
     /* First boot, or a discarded verification attempt: enroll. */
     {
         uint8_t salt[PUF_SALT_SZ];
+        uint8_t helper[WC_PUF_HELPER_BYTES];
+
         if (puf_make_salt(salt) != 0) {
             wc_PufZeroize(&ctx);
-            puf_halt_blinking(100, 100, 0x20, 0, 0);
+            puf_halt(PUF_CODE_CONFIG, 0x20, 0, 0);
         }
         if (wc_PufEnroll(&ctx) != 0) {
             wc_PufZeroize(&ctx);
-            puf_halt_blinking(100, 100, 0x20, 0, 0);
+            puf_halt(PUF_CODE_CONFIG, 0x20, 0, 0);
         }
-        puf_write_checkpoint(PUF_MAGIC_PROVISIONAL, salt, ctx.helperData);
-        ForceZero(salt, sizeof(salt));
+        if (wc_PufGetHelperData(&ctx, helper, sizeof(helper)) != 0) {
+            wc_PufZeroize(&ctx);
+            puf_halt(PUF_CODE_CONFIG, 0x20, 0, 0);
+        }
+        puf_write_checkpoint(PUF_MAGIC_PROVISIONAL, salt, helper);
+        ForceZero(helper, sizeof(helper));
         wc_PufZeroize(&ctx);
     }
 
@@ -357,6 +410,6 @@ int puf_provision(void)
      * reset, so the response would be replayed rather than re-measured and
      * the check would prove nothing. Ask for a real power cycle.
      */
-    puf_halt_blinking(700, 300, 0x20, 0x20, 0);
+    puf_halt(PUF_CODE_ENROLLED, 0x20, 0x20, 0);
     return -1;
 }

@@ -36,8 +36,43 @@
 
 /* SRAM PUF root of trust: the device master secret is reconstructed at boot
  * instead of being stored in flash. See src/puf_sram.c.
+ *
+ * BCH profile: t=13 (k=50) rather than the t=10 default. A reconstruction
+ * failure here costs the user every registered credential, so error
+ * correction is worth far more than footprint. Exact binomial tails for the
+ * per-boot failure probability, 16 codewords of 127 bits:
+ *
+ *      SRAM BER    t=10      t=13      t=15
+ *          3%      2.6e-2    4.9e-4    2.4e-5
+ *          4%      1.9e-1    9.5e-3    8.2e-4
+ *          5%      5.9e-1    7.2e-2    1.0e-2
+ *          6%      9.1e-1    2.8e-1    6.2e-2
+ *
+ * The default t=10 fails well over half of all boots at 5% BER, which is
+ * within the normal range for SRAM PUFs. t=13 is ~100x better there.
+ *
+ * t=15 is better still, but the code-offset construction leaks (n-k) bits per
+ * codeword, so usable min-entropy is about ncw * (127*rho - (127-k)) for an
+ * SRAM min-entropy rate rho. At 16 codewords:
+ *
+ *      rho     t=10      t=13      t=15
+ *      0.70    414 bits  190 bits    0 bits
+ *      0.75    516 bits  292 bits   68 bits
+ *      0.80    618 bits  394 bits  170 bits
+ *
+ * t=15 collapses below the 128-bit security level of the P-256 credential
+ * keys as soon as rho is pessimistic, and reaches zero at rho=0.70. t=13
+ * stays above 128 bits across the whole plausible range. Raising the codeword
+ * count would buy back entropy but costs reliability, since reconstruction
+ * fails if any single codeword exceeds t.
+ *
+ * Enrollment and reconstruction must agree on these values or the derived key
+ * is silently wrong; puf_sram.c persists WC_PUF_PROFILE_ID with the helper
+ * data and checks it via wc_PufReconstructEx().
  */
 #define WOLFSSL_PUF
+#define WC_PUF_BCH_T          13
+#define WC_PUF_NUM_CODEWORDS  16
 extern int custom_random_seed(unsigned char* output, unsigned int sz);
 #define CUSTOM_RAND_GENERATE_SEED custom_random_seed
 
