@@ -3,7 +3,8 @@
 ## Turn a rp2040 into a personal authentication key
 
 Universal FIDO2/U2F key using Raspberry Pi Pico (rp2040) and wolfCrypt. Works with
-any raspberry-pi pico device with only one component added (pushbutton on GPIO15).
+any raspberry-pi pico device with only one component added (a pushbutton). Other
+rp2040 boards are selectable at build time; see [Supported boards](#supported-boards).
 
 ### Goals and security model
 
@@ -69,17 +70,53 @@ FIDO/U2F mandates the use of a single button to indicate that the user is
 actually present when the key is used. Without this button the authenticator
 will never assert user presence.
 
-For this purpose, Fidelio requires a normally-open push-button between GPIO15
-and GND.
+For this purpose, Fidelio requires a normally-open push-button between GND and
+the presence pin of the board it is built for. The pin depends on the board;
+see the table below.
 
-On the Raspberry-pi pico board, this button can normally be soldered in place:
+On the Raspberry-pi pico board the button goes on GPIO15, and can normally be
+soldered in place:
 
 ![Raspberry Pico soldering](doc/raspi_mod_button.png)
 
+Fidelio also uses an LED to signal that it is waiting for the button to be
+pressed, and to blink the halt codes described further down. Some boards have a
+plain LED, others a single WS2812 RGB LED; the firmware drives whichever the
+selected board declares.
 
-If you are using a different model and/or you want to change the pin for the
-presence button and LED, just edit [pins.h](src/pins.h) and change the pin number
-defined by the macro `PRESENCE_BUTTON` and `U2F_LED`, respectively.
+### Supported boards
+
+The board is chosen at configure time with `-DBOARD=`. The default is `pico`.
+
+| `BOARD` | Board | Presence button | Indicator | ADC entropy channels |
+|---|---|---|---|---|
+| `pico` (default) | Raspberry Pi Pico (RP2040) | GPIO15 | LED on `PICO_DEFAULT_LED_PIN` | 0-3 (GPIO26-29) |
+| `rp2040-zero` | Waveshare RP2040-Zero v1.1 | GPIO29 [*](#adcnote) | WS2812 RGB LED on GPIO16 | 0-2 (GPIO26-28) |
+
+<a name="adcnote">*</a> The RP2040-Zero exposes no free pin for the button other
+than GPIO29, which is also ADC channel 3. Fidelio seeds its DRBG partly from the
+noise on the floating ADC inputs, and initialising a pin for analog input takes
+it away from its digital function, so that board collects entropy from three
+channels instead of four. The button pin of every board is excluded from its
+ADC channel list for the same reason.
+
+An unrecognised `BOARD` value stops the configure step with an error rather
+than quietly building something else.
+
+#### Adding a board
+
+Two edits, no build-system surgery:
+
+1. Add a block to [src/pins.h](src/pins.h), guarded by a new
+   `FIDELIO_BOARD_<NAME>` macro, defining `PRESENCE_BUTTON`, either
+   `PRESENCE_LED` (plain LED) or `RGB_LED` (WS2812), and `FIDELIO_ADC_CHANNELS`
+   — the list of ADC channels that are left floating on that board. Channel N
+   is GPIO 26+N; leave out any channel whose GPIO you have used for something
+   else.
+2. Add a branch to the `if(BOARD STREQUAL ...)` chain in
+   [CMakeLists.txt](CMakeLists.txt) mapping the new `BOARD` value to that
+   macro, and list the value in the `set_property(CACHE BOARD PROPERTY
+   STRINGS ...)` call above it.
 
 
 ### Build and flash:
@@ -112,6 +149,16 @@ script.
 ```
 cmake -B build -DPICO_COPY_TO_RAM=1 -DFAMILY=rp2040 -DPICO_SDK_PATH=/path/to/fidelio/pico-sdk
 ```
+
+This builds for the Raspberry Pi Pico, which is the default. For a different
+board add `-DBOARD=`, for example:
+
+```
+cmake -B build -DPICO_COPY_TO_RAM=1 -DFAMILY=rp2040 -DPICO_SDK_PATH=/path/to/fidelio/pico-sdk \
+      -DBOARD=rp2040-zero
+```
+
+See [Supported boards](#supported-boards) for the accepted values.
 
 4. Compile:
 
