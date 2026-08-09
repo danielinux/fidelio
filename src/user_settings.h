@@ -31,8 +31,40 @@
 #define WOLFCRYPT_ONLY
 #define TFM_TIMING_RESISTANT
 #define HAVE_SHA256
+#define HAVE_SHA512
+#define WOLFSSL_SHA512
 #define HAVE_HASHDRBG
 #define HAVE_HKDF
+
+/* Signature algorithms offered to relying parties.
+ *
+ * CTAP2 credential keys are all derived from the same 32 bytes coming out of
+ * HMAC(master_secret, rpIdHash || nonce): ECDSA takes them as a scalar,
+ * Ed25519 as its seed, ML-DSA via wc_MlDsaKey_MakeKeyFromSeed(). Nothing is
+ * stored per algorithm, so breadth here costs code space and time, not state.
+ */
+
+/* EdDSA (COSE -8 / Ed25519 -19). ED25519_SMALL is deliberately NOT set: it
+ * selects the size-optimised ge_low_mem backend, which is markedly slower.
+ * The image runs from flash now, so trading ~20 KB for speed is free.
+ */
+#define HAVE_ED25519
+#define HAVE_ED25519_SIGN
+#define HAVE_ED25519_VERIFY
+#define HAVE_ED25519_MAKE_KEY
+#define HAVE_ED25519_KEY_IMPORT
+#define HAVE_ED25519_KEY_EXPORT
+
+/* ML-DSA / FIPS 204 (COSE -48/-49/-50), RFC 9964 seed-based keys.
+ * SMALL_MEM keeps the working set down; wc_MlDsaKey is ~7.9 KB on its own and
+ * cannot live on the 4 KB core-0 stack, so callers must keep it static.
+ */
+#define WOLFSSL_HAVE_MLDSA
+#define WOLFSSL_MLDSA_SMALL_MEM
+#define WOLFSSL_MLDSA_NO_ASN1
+#define WOLFSSL_SHA3
+#define WOLFSSL_SHAKE128
+#define WOLFSSL_SHAKE256
 
 /* SRAM PUF root of trust: the device master secret is reconstructed at boot
  * instead of being stored in flash. See src/puf_sram.c.
@@ -78,12 +110,16 @@ extern int custom_random_seed(unsigned char* output, unsigned int sz);
 
 //#define WOLFSSL_ASN_TEMPLATE
 
+/* ECDSA. P-256 covers ES256 (-7) and the fully-specified ESP256 (-9);
+ * P-384 covers ES384 (-35) / ESP384 (-51); P-521 covers ES512 (-36) /
+ * ESP512 (-52). FP_MAX_BITS must reach twice the largest curve.
+ */
 #define HAVE_ECC
 #   define ECC_TIMING_RESISTANT
-//#   define ECC_USER_CURVES /* enables only 256-bit by default */
-/* ECC options disabled to reduce size */
 #   define HAVE_ECC256
-#   define FP_MAX_BITS (256 + 256)
+#   define HAVE_ECC384
+#   define HAVE_ECC521
+#   define FP_MAX_BITS (521 * 2 + 64)
 #   define SP_WORD_SIZE 32
 #   ifndef ULLONG_MAX
 #       define ULLONG_MAX 18446744073709551615ULL
@@ -91,8 +127,9 @@ extern int custom_random_seed(unsigned char* output, unsigned int sz);
 #   define WOLFSSL_SP
 #   define WOLFSSL_SP_MATH
 #   define WOLFSSL_HAVE_SP_ECC
+#   define WOLFSSL_SP_384
+#   define WOLFSSL_SP_521
 
-#define ED25519_SMALL
 #define WOLFSSL_CURVE25519
 
 #define NO_INLINE
@@ -107,6 +144,11 @@ extern int custom_random_seed(unsigned char* output, unsigned int sz);
 #define WOLFSSL_SP_ARM_THUMB_ASM
 
 /* Disables - For minimum wolfCrypt build */
+/* Fidelio never derives keys from passwords; also drops the encrypted-key
+ * paths in asn.c that pull in wc_CryptKey. */
+#define NO_PWDBASED
+#define NO_PKCS8
+#define NO_PKCS12
 #define NO_CMAC
 #define NO_RSA
 #define NO_RC4
@@ -129,7 +171,11 @@ extern int custom_random_seed(unsigned char* output, unsigned int sz);
 #define WOLFSSL_NO_SOCK
 
 
-#define WOLFSSL_SP_NO_MALLOC
+/* SP temporaries go on the heap, not the stack: core 0's stack is pinned to
+ * SCRATCH_Y's 4 KB by the SDK memory map, which P-521 and ML-DSA would
+ * overflow. Running from flash leaves ~240 KB of RAM for the heap, so this
+ * costs nothing. NO_DYN_STACK stays on to keep alloca out of the picture.
+ */
 #define WOLFSSL_SP_NO_DYN_STACK
 
 #endif /* !H_USER_SETTINGS_ */

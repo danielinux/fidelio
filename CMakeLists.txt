@@ -35,6 +35,15 @@ project(${PROJECT})
 # Checks this example is valid for the family and initializes the project
 family_initialize_project(${PROJECT} ${CMAKE_CURRENT_LIST_DIR})
 
+option(FIDELIO_BENCH "Build the wolfCrypt benchmark instead of the authenticator" OFF)
+set(FIDELIO_BENCH_CLOCK_KHZ 48000 CACHE STRING "System clock for the benchmark build, kHz")
+if(FIDELIO_BENCH)
+    set(FIDELIO_MAIN_SRC ${CMAKE_CURRENT_SOURCE_DIR}/src/bench_main.c)
+    message(STATUS "Fidelio: BENCHMARK build at ${FIDELIO_BENCH_CLOCK_KHZ} kHz")
+else()
+    set(FIDELIO_MAIN_SRC ${CMAKE_CURRENT_SOURCE_DIR}/src/fidelio.c)
+endif()
+
 add_executable(${PROJECT})
 
 #target_compile_options(${PROJECT} PUBLIC
@@ -45,7 +54,7 @@ add_executable(${PROJECT})
 #
 # Example source
 target_sources(${PROJECT} PUBLIC
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/fidelio.c
+        ${FIDELIO_MAIN_SRC}
         ${CMAKE_CURRENT_SOURCE_DIR}/src/rand.c
         ${CMAKE_CURRENT_SOURCE_DIR}/src/puf_sram.c
         ${CMAKE_CURRENT_SOURCE_DIR}/src/flash_rt.c
@@ -144,6 +153,20 @@ family_configure_device_example(${PROJECT})
 # the base of SCRATCH_X. Must come after family_configure_device_example(),
 # which is what installs the SDK's default memmap.
 pico_set_linker_script(${PROJECT} ${CMAKE_CURRENT_SOURCE_DIR}/src/memmap_fidelio.ld)
+
+if(FIDELIO_BENCH)
+    target_sources(${PROJECT} PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/lib/wolfssl/wolfcrypt/benchmark/benchmark.c)
+    target_compile_definitions(${PROJECT} PUBLIC
+        BENCH_EMBEDDED
+        WOLFSSL_USER_CURRTIME
+        NO_MAIN_DRIVER
+        FIDELIO_BENCH_CLOCK_KHZ=${FIDELIO_BENCH_CLOCK_KHZ})
+    # benchmark.c writes to a console this board does not have; capture it.
+    set_source_files_properties(
+        ${CMAKE_CURRENT_SOURCE_DIR}/lib/wolfssl/wolfcrypt/benchmark/benchmark.c
+        PROPERTIES COMPILE_DEFINITIONS "printf=bench_printf")
+endif()
 
 # SRAM PUF bring-up diagnostic. Replaces the authenticator with a report on
 # the health of this board's SRAM response, printed on UART0 (GP0/GP1,
