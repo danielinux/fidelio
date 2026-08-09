@@ -389,3 +389,13 @@ see `man pam_fido2` for tuning user verification, PIN prompts, and per-service
 **Ensure you always keep a root console open when changing pam.d configuration, and
 test your changes properly after each change to avoid locking yourself out of
 your machine**
+
+### License
+
+Fidelio is free software under the **GNU General Public License, version 3 or
+later**; the full text is in [LICENSE](LICENSE).
+
+It links wolfSSL and wolfCOSE, both of which are GPLv3, so the combined work is
+GPLv3. wolfSSL Inc. also offers those components under a commercial licence for
+proprietary use -- see `lib/wolfssl/LICENSING` -- which is the route to take if
+GPLv3 does not suit.
