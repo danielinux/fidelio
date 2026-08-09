@@ -120,8 +120,9 @@ void indicator_set(uint16_t r, uint16_t g, uint16_t b)
 #endif
 }
 
-void indicator_wait_for_button(uint16_t r, uint16_t g, uint16_t b)
+bool indicator_wait_for_button(uint16_t r, uint16_t g, uint16_t b)
 {
+    absolute_time_t deadline;
 #ifdef RGB_LED
     unsigned int idx = 0;
     absolute_time_t next_step = make_timeout_time_ms(80);
@@ -132,26 +133,46 @@ void indicator_wait_for_button(uint16_t r, uint16_t g, uint16_t b)
 
     /* If already pressed, wait for release before arming */
     indicator_set(r, g, b);
+    deadline = make_timeout_time_ms(PRESENCE_TIMEOUT_MS);
     while (gpio_get(PRESENCE_BUTTON) == 0) {
+        if (absolute_time_diff_us(get_absolute_time(), deadline) <= 0) {
+            indicator_set_idle();
+            return false;
+        }
         sleep_ms(2);
     }
 
     next_step = make_timeout_time_ms(80);
     while (gpio_get(PRESENCE_BUTTON) != 0) {
+        if (absolute_time_diff_us(get_absolute_time(), deadline) <= 0) {
+            indicator_set_idle();
+            return false;
+        }
         sleep_ms(2);
     }
     sleep_ms(30); /* Debounce */
     indicator_set_idle();
+    return true;
 #else
     indicator_set(r, g, b);
+    deadline = make_timeout_time_ms(PRESENCE_TIMEOUT_MS);
     /* If already pressed, wait for release before arming */
     while (gpio_get(PRESENCE_BUTTON) == 0) {
+        if (absolute_time_diff_us(get_absolute_time(), deadline) <= 0) {
+            indicator_set_idle();
+            return false;
+        }
         sleep_ms(2);
     }
     while (gpio_get(PRESENCE_BUTTON) != 0) {
+        if (absolute_time_diff_us(get_absolute_time(), deadline) <= 0) {
+            indicator_set_idle();
+            return false;
+        }
         sleep_ms(2);
     }
     sleep_ms(30);
     indicator_set_idle();
+    return true;
 #endif
 }

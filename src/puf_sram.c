@@ -198,6 +198,38 @@ static int puf_make_salt(uint8_t *salt)
     return (ret == 0) ? 0 : -1;
 }
 
+int puf_rotate_salt(void)
+{
+    const struct puf_checkpoint *cp = (const struct puf_checkpoint *)FLASH_PUF_ADDR;
+    wc_PufCtx ctx;
+    uint8_t salt[PUF_SALT_SZ];
+    uint8_t helper[WC_PUF_HELPER_BYTES];
+    uint32_t magic = cp->magic;
+    int ret = -1;
+
+    if (magic != PUF_MAGIC_COMMITTED)
+        return -1;
+    memcpy(helper, cp->helper, sizeof(helper));
+
+    if (puf_make_salt(salt) != 0)
+        return -1;
+
+    /* Re-derive in place from the snapshot taken at boot, so the device stays
+     * usable across the reset rather than demanding a power cycle. */
+    if (wc_PufInit(&ctx) == 0 &&
+        wc_PufReadSram(&ctx, puf_raw, sizeof(puf_raw)) == 0 &&
+        wc_PufReconstructEx(&ctx, helper, sizeof(helper),
+                            (word32)WC_PUF_PROFILE_ID) == 0) {
+        puf_write_checkpoint(PUF_MAGIC_COMMITTED, salt, helper);
+        ret = puf_derive(&ctx, salt);
+    }
+    wc_PufZeroize(&ctx);
+    ForceZero(salt, sizeof(salt));
+    ForceZero(helper, sizeof(helper));
+    return ret;
+}
+
+
 #ifdef FIDELIO_PUF_DIAG
 #include <stdio.h>
 
@@ -453,6 +485,20 @@ int puf_provision(void)
         puf_halt(PUF_CODE_CONFIG, 0x20, 0, 0);
 
     puf_sram_snapshot();
+
+#ifndef FIDELIO_PUF_DIAG
+    /* The bring-up diagnostic stores a raw SRAM reference readout in its log
+     * sector. That readout IS the secret material the fuzzy extractor turns
+     * into the master key, so leaving it in flash after switching to the
+     * real firmware would undo the entire point of not storing the key.
+     * Scrub it on the first production boot that finds one.
+     */
+    {
+        const uint32_t *diag_magic = (const uint32_t *)(XIP_BASE + 0x1FF000);
+        if (*diag_magic != 0xFFFFFFFFu)
+            fidelio_flash_erase(0x1FF000, FLASH_SECTOR_SIZE);
+    }
+#endif
 
     if (wc_PufInit(&ctx) != 0)
         puf_halt(PUF_CODE_CONFIG, 0x20, 0, 0);

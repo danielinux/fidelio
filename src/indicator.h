@@ -21,9 +21,18 @@
 #ifndef INDICATOR_H
 #define INDICATOR_H
 
+#include <stdbool.h>
+#include <stdint.h>
+
 void indicator_init(void);
 void indicator_set_idle(void);
 void indicator_set(uint16_t r, uint16_t g, uint16_t b);
-void indicator_wait_for_button(uint16_t r, uint16_t g, uint16_t b);
+/* Wait for the presence button, bounded. Returns true if it was pressed,
+ * false on timeout. An unbounded wait lets any USB host wedge the
+ * authenticator indefinitely by starting an operation and never touching the
+ * button, since CTAPHID offers no way to cancel it here.
+ */
+#define PRESENCE_TIMEOUT_MS 30000
+bool indicator_wait_for_button(uint16_t r, uint16_t g, uint16_t b);
 
 #endif

@@ -23,6 +23,7 @@
 #include "indicator.h"
 #include "cred_alg.h"
 #include "cred_store.h"
+#include "puf_sram.h"
 #include "wolfssl/wolfcrypt/puf.h"
 #include "wolfcose/wolfcose.h"
 
@@ -41,6 +42,7 @@ extern void ForceZero(void* mem, word32 len);
 #define CTAP2_ERR_PIN_NOT_SET        0x35
 #define CTAP2_ERR_PIN_AUTH_INVALID   0x33
 #define CTAP2_ERR_KEY_STORE_FULL     0x28
+#define CTAP2_ERR_USER_ACTION_TIMEOUT 0x3A
 
 #define CTAP2_PIN_PROTOCOL_SUPPORTED 1
 #define CTAP2_CMD_MAKE_CREDENTIAL    0x01
@@ -1300,7 +1302,11 @@ static int ctap2_make_credential(const uint8_t *payload, uint16_t payload_len,
     wc_Sha256Free(&sha);
 
     /* Require user presence */
-    indicator_wait_for_button(0x0, 0x20, 0);
+    if (!indicator_wait_for_button(0x0, 0x20, 0)) {
+        reply[0] = CTAP2_ERR_USER_ACTION_TIMEOUT;
+        *reply_len = 1;
+        return 0;
+    }
 
     if (wc_InitRng(&rng) != 0) {
         reply[0] = CTAP2_ERR_INVALID_COMMAND;
@@ -1571,7 +1577,12 @@ static int ctap2_get_assertion(const uint8_t *payload, uint16_t payload_len,
     }
 
     /* Require user presence */
-    indicator_wait_for_button(0, 0, 0x20);
+    if (!indicator_wait_for_button(0, 0, 0x20)) {
+        cred_key_free(&user_key);
+        reply[0] = CTAP2_ERR_USER_ACTION_TIMEOUT;
+        *reply_len = 1;
+        return 0;
+    }
 
     if (wc_InitRng(&rng) != 0) {
         reply[0] = CTAP2_ERR_INVALID_COMMAND;
@@ -1866,7 +1877,13 @@ static int ctap2_client_pin_inner(const uint8_t *payload, uint16_t payload_len,
             if (pin_hash_plain(pin_tmp, pin_len, pin_store.pin_hash) != 0) {
                 reply[0] = CTAP2_ERR_PIN_AUTH_INVALID; *reply_len = 1; return 0;
             }
-            pin_restore_retries();
+            /* Unconditional: this call is what commits the PIN hash and the
+             * magic that marks a PIN as configured. pin_restore_retries()
+             * would skip the write whenever the counter already sat at its
+             * maximum, which is precisely the first-setPIN case.
+             */
+            pin_store.retries = PIN_MAX_RETRIES;
+            pin_state_save();
             wc_InitRng(&rng);
             pin_reset_token(&rng);
             wc_FreeRng(&rng);
@@ -1881,7 +1898,7 @@ static int ctap2_client_pin_inner(const uint8_t *payload, uint16_t payload_len,
             if (pin_store.magic != FLASH_PIN_MAGIC) {
                 reply[0] = CTAP2_ERR_PIN_NOT_SET; *reply_len = 1; return 0;
             }
-            if (pin_spend_retry() != 0) {
+            if (pin_store.retries == 0) {
                 reply[0] = CTAP2_ERR_PIN_BLOCKED; *reply_len = 1; return 0;
             }
             if (!key_agree || !pin_agree_valid || parse_cose_pubkey(key_agree, key_agree_len, platform_qx, platform_qy) != 0) {
@@ -1901,6 +1918,9 @@ static int ctap2_client_pin_inner(const uint8_t *payload, uint16_t payload_len,
                 if (wc_AesSetKey(&aes, pin_shared + 32, 32, iv, AES_DECRYPTION) != 0) { wc_AesFree(&aes); return write_error(CTAP2_ERR_PIN_AUTH_INVALID, reply, reply_len); }
                 if (wc_AesCbcDecrypt(&aes, pin_tmp, pinHashEnc, pinHashEnc_len) != 0) { wc_AesFree(&aes); return write_error(CTAP2_ERR_PIN_AUTH_INVALID, reply, reply_len); }
                 wc_AesFree(&aes);
+            }
+            if (pin_spend_retry() != 0) {
+                reply[0] = CTAP2_ERR_PIN_BLOCKED; *reply_len = 1; return 0;
             }
             if (!ct_memeq(pin_tmp, pin_store.pin_hash, 16)) {
                 ForceZero(pin_tmp, sizeof(pin_tmp));
@@ -1936,7 +1956,13 @@ static int ctap2_client_pin_inner(const uint8_t *payload, uint16_t payload_len,
             if (pin_hash_plain(pin_tmp, pin_len, pin_store.pin_hash) != 0) {
                 reply[0] = CTAP2_ERR_PIN_AUTH_INVALID; *reply_len = 1; return 0;
             }
-            pin_restore_retries();
+            /* Unconditional: this call is what commits the PIN hash and the
+             * magic that marks a PIN as configured. pin_restore_retries()
+             * would skip the write whenever the counter already sat at its
+             * maximum, which is precisely the first-setPIN case.
+             */
+            pin_store.retries = PIN_MAX_RETRIES;
+            pin_state_save();
             wc_InitRng(&rng);
             pin_reset_token(&rng);
             wc_FreeRng(&rng);
@@ -1951,7 +1977,7 @@ static int ctap2_client_pin_inner(const uint8_t *payload, uint16_t payload_len,
             if (pin_store.magic != FLASH_PIN_MAGIC) {
                 reply[0] = CTAP2_ERR_PIN_NOT_SET; *reply_len = 1; return 0;
             }
-            if (pin_spend_retry() != 0) {
+            if (pin_store.retries == 0) {
                 reply[0] = CTAP2_ERR_PIN_BLOCKED; *reply_len = 1; return 0;
             }
             if (!key_agree || !pin_agree_valid || parse_cose_pubkey(key_agree, key_agree_len, platform_qx, platform_qy) != 0) {
@@ -1971,6 +1997,9 @@ static int ctap2_client_pin_inner(const uint8_t *payload, uint16_t payload_len,
                 if (wc_AesSetKey(&aes, pin_shared + 32, 32, iv, AES_DECRYPTION) != 0) { wc_AesFree(&aes); reply[0] = CTAP2_ERR_PIN_AUTH_INVALID; *reply_len = 1; return 0; }
                 if (wc_AesCbcDecrypt(&aes, pin_tmp, pinHashEnc, pinHashEnc_len) != 0) { wc_AesFree(&aes); reply[0] = CTAP2_ERR_PIN_AUTH_INVALID; *reply_len = 1; return 0; }
                 wc_AesFree(&aes);
+            }
+            if (pin_spend_retry() != 0) {
+                reply[0] = CTAP2_ERR_PIN_BLOCKED; *reply_len = 1; return 0;
             }
             if (!ct_memeq(pin_tmp, pin_store.pin_hash, 16)) {
                 ForceZero(pin_tmp, sizeof(pin_tmp));
@@ -2042,9 +2071,29 @@ int ctap2_handle_cbor(const uint8_t *payload, uint16_t payload_len,
         case CTAP2_CMD_CLIENT_PIN:
             return ctap2_client_pin(payload, payload_len, reply, reply_max, reply_len);
         case CTAP2_CMD_RESET:
+            /* Destructive and reachable by any USB host, so it must be gated
+             * on the physical button exactly like a signing operation.
+             * Without this, plugging the key into a hostile machine is enough
+             * to wipe it. */
+            if (!indicator_wait_for_button(0x20, 0x20, 0)) {
+                reply[0] = CTAP2_ERR_USER_ACTION_TIMEOUT;
+                *reply_len = 1;
+                return 0;
+            }
             pin_state_reset();
             cred_store_wipe();
             fdo_init();
+            /* Wiping the PIN and the vault does not touch credentials: they
+             * are derived from the master secret, not stored. Rotating the
+             * PUF salt re-derives that secret, which is what actually
+             * invalidates every previously issued credential -- including
+             * non-discoverable and U2F ones -- as a reset must.
+             */
+            if (puf_rotate_salt() != 0) {
+                reply[0] = CTAP2_ERR_INVALID_COMMAND;
+                *reply_len = 1;
+                return 0;
+            }
             reply[0] = CTAP2_ERR_SUCCESS;
             *reply_len = 1;
             return 0;

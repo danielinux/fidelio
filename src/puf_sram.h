@@ -47,6 +47,14 @@ int puf_provision(void);
 /* The 32-byte master secret. Valid only after puf_provision() returned 0. */
 const uint8_t *puf_master_secret(void);
 
+/* Draw a fresh salt and re-derive the master secret in place, keeping the
+ * enrolled helper data. Every credential ever derived becomes unreachable,
+ * because they all hang off the master secret -- but the PUF stays enrolled,
+ * so no re-enrollment power cycle is needed. This is what makes an
+ * authenticatorReset actually invalidate credentials.
+ */
+int puf_rotate_salt(void);
+
 /* Erase the checkpoint. The next boot enrolls again, which yields a different
  * master secret and so invalidates every derived credential.
  */
