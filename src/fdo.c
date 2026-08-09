@@ -6,6 +6,7 @@
 
 #include <string.h>
 #include "hardware/flash.h"
+#include "flash_rt.h"
 #include "pico/stdlib.h"
 #include "fdo.h"
 
@@ -25,8 +26,8 @@ static bool fdo_loaded = false;
 
 static void fdo_save(void)
 {
-    flash_range_erase(FLASH_FDO_OFF, FLASH_SECTOR_SIZE);
-    flash_range_program(FLASH_FDO_OFF, (const uint8_t *)&fdo_store, sizeof(fdo_store));
+    fidelio_flash_erase(FLASH_FDO_OFF, FLASH_SECTOR_SIZE);
+    fidelio_flash_program(FLASH_FDO_OFF, (const uint8_t *)&fdo_store, sizeof(fdo_store));
 }
 
 void fdo_init(void)
@@ -86,5 +87,5 @@ void fdo_reset(void)
 {
     memset(&fdo_store, 0, sizeof(fdo_store));
     fdo_loaded = false;
-    flash_range_erase(FLASH_FDO_OFF, FLASH_SECTOR_SIZE);
+    fidelio_flash_erase(FLASH_FDO_OFF, FLASH_SECTOR_SIZE);
 }

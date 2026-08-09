@@ -20,3 +20,5 @@ src/cert.c
 CMakeCache.txt
 elf2uf2/boot_uf2_headers/CMakeFiles
 tests/cose_wire_test
+*.swp
+*.swo

@@ -147,14 +147,14 @@ script.
 3. Configure CMake (pass the full absolute path to pico-sdk):
 
 ```
-cmake -B build -DPICO_COPY_TO_RAM=1 -DFAMILY=rp2040 -DPICO_SDK_PATH=/path/to/fidelio/pico-sdk
+cmake -B build -DFAMILY=rp2040 -DPICO_SDK_PATH=/path/to/fidelio/pico-sdk
 ```
 
 This builds for the Raspberry Pi Pico, which is the default. For a different
 board add `-DBOARD=`, for example:
 
 ```
-cmake -B build -DPICO_COPY_TO_RAM=1 -DFAMILY=rp2040 -DPICO_SDK_PATH=/path/to/fidelio/pico-sdk \
+cmake -B build -DFAMILY=rp2040 -DPICO_SDK_PATH=/path/to/fidelio/pico-sdk \
       -DBOARD=rp2040-zero
 ```
 
@@ -234,7 +234,7 @@ and varies between chips, so a new board is worth measuring before credentials a
 against it.
 
 ```
-cmake -B build-diag -DPICO_COPY_TO_RAM=1 -DFAMILY=rp2040 \
+cmake -B build-diag -DFAMILY=rp2040 \
       -DPICO_SDK_PATH=/path/to/fidelio/pico-sdk -DBOARD=rp2040-zero -DFIDELIO_PUF_DIAG=ON
 cmake --build build-diag
 cp build-diag/fidelio.uf2 /path/to/RPI-RP2

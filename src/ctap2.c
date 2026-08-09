@@ -14,6 +14,7 @@
 #include "wolfssl/wolfcrypt/kdf.h"
 #include "cert.h"
 #include "pins.h"
+#include "flash_rt.h"
 #include "pico/stdlib.h"
 #include "hardware/gpio.h"
 #include "hardware/flash.h"
@@ -229,8 +230,8 @@ static void rk_load(void)
 
 static void rk_save(void)
 {
-    flash_range_erase(FLASH_RK_OFF, FLASH_SECTOR_SIZE);
-    flash_range_program(FLASH_RK_OFF, (const uint8_t *)rk_slots, sizeof(rk_slots));
+    fidelio_flash_erase(FLASH_RK_OFF, FLASH_SECTOR_SIZE);
+    fidelio_flash_program(FLASH_RK_OFF, (const uint8_t *)rk_slots, sizeof(rk_slots));
 }
 
 static int rk_find_free(void)
@@ -273,14 +274,14 @@ static void pin_state_reset(void)
     pin_token_valid = false;
     pin_agree_valid = false;
     pin_agree_consumed = true;
-    flash_range_erase(FLASH_PIN_OFF, FLASH_SECTOR_SIZE);
+    fidelio_flash_erase(FLASH_PIN_OFF, FLASH_SECTOR_SIZE);
 }
 
 static void rk_reset(void)
 {
     memset(rk_slots, 0, sizeof(rk_slots));
     rk_loaded = false;
-    flash_range_erase(FLASH_RK_OFF, FLASH_SECTOR_SIZE);
+    fidelio_flash_erase(FLASH_RK_OFF, FLASH_SECTOR_SIZE);
 }
 
 static void pin_state_load(void)
@@ -300,8 +301,8 @@ static void pin_state_load(void)
 static void pin_state_save(void)
 {
     pin_store.magic = FLASH_PIN_MAGIC;
-    flash_range_erase(FLASH_PIN_OFF, FLASH_SECTOR_SIZE);
-    flash_range_program(FLASH_PIN_OFF, (const uint8_t *)&pin_store, sizeof(pin_store));
+    fidelio_flash_erase(FLASH_PIN_OFF, FLASH_SECTOR_SIZE);
+    fidelio_flash_program(FLASH_PIN_OFF, (const uint8_t *)&pin_store, sizeof(pin_store));
 }
 
 static void pin_reset_token(WC_RNG *rng)

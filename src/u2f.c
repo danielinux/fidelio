@@ -37,6 +37,7 @@
 #include "ctap2.h"
 #include "device_state.h"
 #include "pins.h"
+#include "flash_rt.h"
 #include "indicator.h"
 #include "fdo.h"
 #include "puf_sram.h"
@@ -73,7 +74,7 @@ static void write_counter_page(uint32_t flash_off, uint32_t value)
     uint8_t page_buf[FLASH_PAGE_SIZE];
     memcpy(page_buf, (const void *)(XIP_BASE + flash_off), FLASH_PAGE_SIZE);
     memcpy(page_buf, &value, 4);
-    flash_range_program(flash_off, page_buf, FLASH_PAGE_SIZE);
+    fidelio_flash_program(flash_off, page_buf, FLASH_PAGE_SIZE);
 }
 
 static void __not_in_flash_func(U2F_Counter_up)(void)
@@ -81,10 +82,10 @@ static void __not_in_flash_func(U2F_Counter_up)(void)
     U2F_Counter++;
     if ((U2F_Counter & 0x01) == 0x01) {
         write_counter_page(FLASH_CTR_ADDR1_OFF, U2F_Counter);
-        flash_range_erase(FLASH_CTR_ADDR0_OFF, FLASH_SECTOR_SIZE);
+        fidelio_flash_erase(FLASH_CTR_ADDR0_OFF, FLASH_SECTOR_SIZE);
     } else {
         write_counter_page(FLASH_CTR_ADDR0_OFF, U2F_Counter);
-        flash_range_erase(FLASH_CTR_ADDR1_OFF, FLASH_SECTOR_SIZE);
+        fidelio_flash_erase(FLASH_CTR_ADDR1_OFF, FLASH_SECTOR_SIZE);
     }
 }
 
@@ -123,8 +124,8 @@ void __not_in_flash_func(u2f_factory_reset)(void)
      * replayed unchanged across the warm reset below.
      */
     puf_factory_erase();
-    flash_range_erase(FLASH_CTR_ADDR0_OFF, FLASH_SECTOR_SIZE);
-    flash_range_erase(FLASH_CTR_ADDR1_OFF, FLASH_SECTOR_SIZE);
+    fidelio_flash_erase(FLASH_CTR_ADDR0_OFF, FLASH_SECTOR_SIZE);
+    fidelio_flash_erase(FLASH_CTR_ADDR1_OFF, FLASH_SECTOR_SIZE);
     ctap2_reset_state();
     fdo_reset();
     U2F_Counter = 0;

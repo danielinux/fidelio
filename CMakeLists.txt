@@ -48,6 +48,8 @@ target_sources(${PROJECT} PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/src/fidelio.c
         ${CMAKE_CURRENT_SOURCE_DIR}/src/rand.c
         ${CMAKE_CURRENT_SOURCE_DIR}/src/puf_sram.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/flash_rt.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/alg_probe.c
         ${CMAKE_CURRENT_SOURCE_DIR}/src/cert.c
         ${CMAKE_CURRENT_SOURCE_DIR}/src/ctap2.c
         ${CMAKE_CURRENT_SOURCE_DIR}/src/fdo.c
@@ -80,6 +82,10 @@ target_sources(${PROJECT} PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/lib/wolfssl/wolfcrypt/src/sp_int.c
         ${CMAKE_CURRENT_SOURCE_DIR}/lib/wolfssl/wolfcrypt/src/sp_armthumb.c
         ${CMAKE_CURRENT_SOURCE_DIR}/lib/wolfssl/wolfcrypt/src/sp_c32.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/lib/wolfssl/wolfcrypt/src/ed25519.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/lib/wolfssl/wolfcrypt/src/fe_operations.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/lib/wolfssl/wolfcrypt/src/sha3.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/lib/wolfssl/wolfcrypt/src/wc_mldsa.c
         )
 
 # Example include
@@ -90,6 +96,20 @@ target_include_directories(${PROJECT} PUBLIC
         )
 
         target_compile_definitions( ${PROJECT} PUBLIC WOLFSSL_USER_SETTINGS)
+
+# Measurement/feature hook: extra wolfSSL feature macros.
+if(FIDELIO_EXTRA_DEFS)
+    target_compile_definitions(${PROJECT} PUBLIC ${FIDELIO_EXTRA_DEFS})
+endif()
+
+# Build-sizing probe (see src/alg_probe.c). --undefined forces the linker to
+# keep it, so the measurement reflects real code size rather than what
+# --gc-sections would otherwise discard.
+option(FIDELIO_ALG_PROBE "Force-link the algorithm sizing probe" OFF)
+if(FIDELIO_ALG_PROBE)
+    target_compile_definitions(${PROJECT} PUBLIC FIDELIO_ALG_PROBE)
+    target_link_options(${PROJECT} PUBLIC -Wl,--undefined=fidelio_alg_probe)
+endif()
 
 # Board pinout selector consumed by src/pins.h
 target_compile_definitions( ${PROJECT} PUBLIC ${FIDELIO_BOARD_DEFINE})

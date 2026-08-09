@@ -30,6 +30,7 @@
 #include "wolfssl/wolfcrypt/error-crypt.h"
 #include "puf_sram.h"
 #include "indicator.h"
+#include "flash_rt.h"
 
 extern void ForceZero(void* mem, word32 len);
 
@@ -102,7 +103,7 @@ struct puf_checkpoint {
     uint8_t helper[WC_PUF_HELPER_BYTES];
 };
 
-/* flash_range_program() writes whole pages. */
+/* fidelio_flash_program() writes whole pages. */
 #define PUF_PAGE_SPAN (((sizeof(struct puf_checkpoint) + FLASH_PAGE_SIZE - 1) \
                         / FLASH_PAGE_SIZE) * FLASH_PAGE_SIZE)
 
@@ -156,14 +157,14 @@ static void __not_in_flash_func(puf_write_checkpoint)(uint32_t magic,
     cp->profileId = (uint32_t)WC_PUF_PROFILE_ID;
     memcpy(cp->salt, salt, PUF_SALT_SZ);
     memcpy(cp->helper, helper, WC_PUF_HELPER_BYTES);
-    flash_range_erase(FLASH_PUF_OFF, FLASH_SECTOR_SIZE);
-    flash_range_program(FLASH_PUF_OFF, page, sizeof(page));
+    fidelio_flash_erase(FLASH_PUF_OFF, FLASH_SECTOR_SIZE);
+    fidelio_flash_program(FLASH_PUF_OFF, page, sizeof(page));
     ForceZero(page, sizeof(page));
 }
 
 void __not_in_flash_func(puf_factory_erase)(void)
 {
-    flash_range_erase(FLASH_PUF_OFF, FLASH_SECTOR_SIZE);
+    fidelio_flash_erase(FLASH_PUF_OFF, FLASH_SECTOR_SIZE);
     ForceZero(master_secret, sizeof(master_secret));
     secret_valid = false;
 }
@@ -280,8 +281,8 @@ static void __not_in_flash_func(diag_log_save)(void)
     uint8_t page[FLASH_SECTOR_SIZE];
     memset(page, 0xFF, sizeof(page));
     memcpy(page, &diag_log, sizeof(diag_log));
-    flash_range_erase(FLASH_DIAG_OFF, FLASH_SECTOR_SIZE);
-    flash_range_program(FLASH_DIAG_OFF, page, sizeof(page));
+    fidelio_flash_erase(FLASH_DIAG_OFF, FLASH_SECTOR_SIZE);
+    fidelio_flash_program(FLASH_DIAG_OFF, page, sizeof(page));
 }
 
 /* Bring-up diagnostic. Reconstruction fails if any single 127-bit codeword

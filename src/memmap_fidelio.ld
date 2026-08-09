@@ -1,15 +1,20 @@
 /* Fidelio memory map.
  *
  * Copied verbatim from
- *   pico-sdk/src/rp2_common/pico_standard_link/memmap_copy_to_ram.ld
+ *   pico-sdk/src/rp2_common/pico_standard_link/memmap_default.ld
  * (pico-sdk 1.3.1, the pinned submodule revision) with one addition: the
  * .puf_sram NOLOAD section reserving the SRAM PUF response at the base of
  * SCRATCH_X. Search for "Fidelio:" below for the delta.
  *
- * The SDK does not offer a way to append a section to its own script -- ld's
- * INSERT directive only augments the built-in default script, not one given
- * with --script -- so this fork is unavoidable. Re-apply the delta if the
- * pico-sdk submodule is ever bumped.
+ * The image executes from flash over XIP; only functions marked
+ * __not_in_flash_func() land in .time_critical* inside .data, which crt0
+ * copies to RAM at startup. That is what lets the flash-mutation helpers in
+ * src/flash_rt.c run while the flash they came from is unreadable.
+ *
+ * The SDK offers no way to append a section to its own script -- ld's INSERT
+ * directive only augments the built-in default script, not one given with
+ * --script -- so this fork is unavoidable. Re-apply the delta if the pico-sdk
+ * submodule is ever bumped.
  *
  * Based on GCC ARM embedded samples.
    Defines the following symbols for use by code:
@@ -71,16 +76,38 @@ SECTIONS
        launches only, to perform proper flash setup.
     */
 
-    .flashtext : {
+    .text : {
         __logical_binary_start = .;
         KEEP (*(.vectors))
         KEEP (*(.binary_info_header))
         __binary_info_header_end = .;
         KEEP (*(.reset))
-    }
+        /* TODO revisit this now memset/memcpy/float in ROM */
+        /* bit of a hack right now to exclude all floating point and time critical (e.g. memset, memcpy) code from
+         * FLASH ... we will include any thing excluded here in .data below by default */
+        *(.init)
+        *(EXCLUDE_FILE(*libgcc.a: *libc.a:*lib_a-mem*.o *libm.a:) .text*)
+        *(.fini)
+        /* Pull all c'tors into .text */
+        *crtbegin.o(.ctors)
+        *crtbegin?.o(.ctors)
+        *(EXCLUDE_FILE(*crtend?.o *crtend.o) .ctors)
+        *(SORT(.ctors.*))
+        *(.ctors)
+        /* Followed by destructors */
+        *crtbegin.o(.dtors)
+        *crtbegin?.o(.dtors)
+        *(EXCLUDE_FILE(*crtend?.o *crtend.o) .dtors)
+        *(SORT(.dtors.*))
+        *(.dtors)
+
+        *(.eh_frame*)
+        . = ALIGN(4);
+    } > FLASH
 
     .rodata : {
-        /* segments not marked as .flashdata are instead pulled into .data (in RAM) to avoid accidental flash accesses */
+        *(EXCLUDE_FILE(*libgcc.a: *libc.a:*lib_a-mem*.o *libm.a:) .rodata*)
+        . = ALIGN(4);
         *(SORT_BY_ALIGNMENT(SORT_BY_NAME(.flashdata*)))
         . = ALIGN(4);
     } > FLASH
@@ -108,35 +135,12 @@ SECTIONS
     __binary_info_end = .;
     . = ALIGN(4);
 
-    /* Vector table goes first in RAM, to avoid large alignment hole */
+    /* End of .text-like segments */
+    __etext = .;
+
    .ram_vector_table (COPY): {
         *(.ram_vector_table)
     } > RAM
-
-    .text : {
-        __ram_text_start__ = .;
-        *(.init)
-        *(.text*)
-        *(.fini)
-        /* Pull all c'tors into .text */
-        *crtbegin.o(.ctors)
-        *crtbegin?.o(.ctors)
-        *(EXCLUDE_FILE(*crtend?.o *crtend.o) .ctors)
-        *(SORT(.ctors.*))
-        *(.ctors)
-        /* Followed by destructors */
-        *crtbegin.o(.dtors)
-        *crtbegin?.o(.dtors)
-        *(EXCLUDE_FILE(*crtend?.o *crtend.o) .dtors)
-        *(SORT(.dtors.*))
-        *(.dtors)
-
-        *(.eh_frame*)
-        . = ALIGN(4);
-        __ram_text_end__ = .;
-    } > RAM AT> FLASH
-    __ram_text_source__ = LOADADDR(.text);
-
 
     .data : {
         __data_start__ = .;
@@ -144,6 +148,8 @@ SECTIONS
 
         *(.time_critical*)
 
+        /* remaining .text and .rodata; i.e. stuff we exclude above because we want it in RAM */
+        *(.text*)
         . = ALIGN(4);
         *(.rodata*)
         . = ALIGN(4);
@@ -185,15 +191,12 @@ SECTIONS
         /* All data end */
         __data_end__ = .;
     } > RAM AT> FLASH
-    /* __etext is the name of the .data init source pointer (...) */
-    __etext = LOADADDR(.data);
 
     .uninitialized_data (COPY): {
         . = ALIGN(4);
         *(.uninitialized_data*)
     } > RAM
 
-    /* Start and end symbols must be word-aligned */
     /* Fidelio: SRAM PUF response region.
      *
      * The master secret is reconstructed at every boot from the power-on state
@@ -203,12 +206,10 @@ SECTIONS
      *
      * SCRATCH_X is the only bank on RP2040 that qualifies: the bootrom copies
      * the second stage loader to the top of SRAM and keeps its stack there,
-     * which is SCRATCH_Y; core 0's stack is SCRATCH_Y (__StackTop); and
-     * PICO_COPY_TO_RAM=1 copies the image into the RAM region at 0x20000000.
-     * Placing the region first means a future user of .scratch_x.* is
-     * displaced rather than silently overlapping the PUF response, and
-     * Fidelio does not link pico_multicore, so core 1's stack cannot claim
-     * the bank either.
+     * which is SCRATCH_Y; core 0's stack is SCRATCH_Y (__StackTop). Placing
+     * the region first means a future user of .scratch_x.* is displaced rather
+     * than silently overlapping the PUF response, and Fidelio does not link
+     * pico_multicore, so core 1's stack cannot claim the bank either.
      */
     .puf_sram (NOLOAD) : {
         __puf_sram_start__ = .;
@@ -217,6 +218,7 @@ SECTIONS
         __puf_sram_end__ = .;
     } > SCRATCH_X
 
+    /* Start and end symbols must be word-aligned */
     .scratch_x : {
         __scratch_x_start__ = .;
         *(.scratch_x.*)
