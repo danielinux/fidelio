@@ -31,9 +31,15 @@
 
 extern void ForceZero(void* mem, word32 len);
 
-/* Reuses the sector that held the plaintext resident-key slots. */
-#define FLASH_VAULT_OFF   0x74000
-#define FLASH_VAULT_ADDR  ((const uint8_t *)(XIP_BASE + FLASH_VAULT_OFF))
+/* Two sectors, written alternately. A sector must be erased before it can be
+ * reprogrammed, and a power cut inside that window would otherwise destroy the
+ * only copy of every discoverable credential. Alternating means the previous
+ * sealed copy survives; the AEAD tag already rejects a half-written one, so no
+ * separate integrity marker is needed here.
+ */
+#define FLASH_VAULT_A_OFF 0x74000
+#define FLASH_VAULT_B_OFF 0x77000
+#define VAULT_ADDR(off)   ((const uint8_t *)(XIP_BASE + (off)))
 #define VAULT_MAGIC       0x46564C54u /* 'FVLT' */
 
 /* Header is stored in the clear; only `slots` is sealed.
@@ -62,6 +68,7 @@ struct vault_header {
 static struct cred_record slots[CRED_STORE_SLOTS];
 static uint32_t vault_version;
 static bool vault_loaded;
+static uint32_t vault_cur_off = FLASH_VAULT_A_OFF;
 
 #define VAULT_PAYLOAD_SZ ((uint16_t)sizeof(slots))
 #define VAULT_TOTAL_SZ   (sizeof(struct vault_header) + VAULT_PAYLOAD_SZ)
@@ -89,25 +96,16 @@ static int vault_key(uint32_t version, uint8_t *key_out)
     return (ret == 0) ? 0 : -1;
 }
 
-int cred_store_load(void)
+/* Try one sector. Returns 0 and fills `slots` if it authenticates. */
+static int vault_try(uint32_t off)
 {
-    const struct vault_header *h = (const struct vault_header *)FLASH_VAULT_ADDR;
-    const uint8_t *ct = FLASH_VAULT_ADDR + sizeof(struct vault_header);
+    const struct vault_header *h = (const struct vault_header *)VAULT_ADDR(off);
+    const uint8_t *ct = VAULT_ADDR(off) + sizeof(struct vault_header);
     uint8_t key[CHACHA20_POLY1305_AEAD_KEYSIZE];
     int ret;
 
-    if (vault_loaded)
-        return 0;
-
-    memset(slots, 0, sizeof(slots));
-    vault_version = 0;
-
-    /* An absent or erased vault is simply an empty one. */
-    if (h->magic != VAULT_MAGIC || h->payload_len != VAULT_PAYLOAD_SZ) {
-        vault_loaded = true;
-        return 0;
-    }
-
+    if (h->magic != VAULT_MAGIC || h->payload_len != VAULT_PAYLOAD_SZ)
+        return -1;
     if (vault_key(h->version, key) != 0)
         return -1;
 
@@ -116,17 +114,49 @@ int cred_store_load(void)
                                       ct, VAULT_PAYLOAD_SZ,
                                       h->tag, (byte *)slots);
     ForceZero(key, sizeof(key));
-
     if (ret != 0) {
-        /* Authentication failure: tampered, or sealed under a master secret
-         * this device no longer has. Refuse to serve it rather than expose
-         * whatever the plaintext buffer now holds.
-         */
+        /* Tampered, torn mid-write, or sealed under a master secret this
+         * device no longer has. Never serve a partially decrypted buffer. */
         memset(slots, 0, sizeof(slots));
         return -1;
     }
+    return 0;
+}
 
-    vault_version = h->version;
+int cred_store_load(void)
+{
+    const struct vault_header *ha = (const struct vault_header *)VAULT_ADDR(FLASH_VAULT_A_OFF);
+    const struct vault_header *hb = (const struct vault_header *)VAULT_ADDR(FLASH_VAULT_B_OFF);
+    uint32_t first, second;
+
+    if (vault_loaded)
+        return 0;
+
+    memset(slots, 0, sizeof(slots));
+    vault_version = 0;
+
+    /* Newest first, falling back to the older copy if the newest is torn. */
+    if (ha->magic == VAULT_MAGIC && hb->magic == VAULT_MAGIC) {
+        bool a_newer = (int32_t)(ha->version - hb->version) > 0;
+        first = a_newer ? FLASH_VAULT_A_OFF : FLASH_VAULT_B_OFF;
+        second = a_newer ? FLASH_VAULT_B_OFF : FLASH_VAULT_A_OFF;
+    } else {
+        first = (ha->magic == VAULT_MAGIC) ? FLASH_VAULT_A_OFF : FLASH_VAULT_B_OFF;
+        second = (first == FLASH_VAULT_A_OFF) ? FLASH_VAULT_B_OFF : FLASH_VAULT_A_OFF;
+    }
+
+    if (vault_try(first) == 0) {
+        vault_cur_off = first;
+    } else if (vault_try(second) == 0) {
+        vault_cur_off = second;
+    } else {
+        /* Neither copy is usable. An absent vault is simply an empty one. */
+        vault_cur_off = FLASH_VAULT_B_OFF; /* first save lands in A */
+        vault_loaded = true;
+        return 0;
+    }
+
+    vault_version = ((const struct vault_header *)VAULT_ADDR(vault_cur_off))->version;
     vault_loaded = true;
     return 0;
 }
@@ -176,8 +206,13 @@ static int vault_save(void)
         return -1;
     }
 
-    fidelio_flash_erase(FLASH_VAULT_OFF, FLASH_SECTOR_SIZE);
-    fidelio_flash_program(FLASH_VAULT_OFF, page, sizeof(vault_page));
+    {
+        uint32_t target = (vault_cur_off == FLASH_VAULT_A_OFF)
+                          ? FLASH_VAULT_B_OFF : FLASH_VAULT_A_OFF;
+        fidelio_flash_erase(target, FLASH_SECTOR_SIZE);
+        fidelio_flash_program(target, page, sizeof(vault_page));
+        vault_cur_off = target;
+    }
     ForceZero(vault_page, sizeof(vault_page));
 
     vault_version++;
@@ -266,5 +301,7 @@ void cred_store_wipe(void)
     ForceZero(slots, sizeof(slots));
     vault_version = 0;
     vault_loaded = false;
-    fidelio_flash_erase(FLASH_VAULT_OFF, FLASH_SECTOR_SIZE);
+    fidelio_flash_erase(FLASH_VAULT_A_OFF, FLASH_SECTOR_SIZE);
+    fidelio_flash_erase(FLASH_VAULT_B_OFF, FLASH_SECTOR_SIZE);
+    vault_cur_off = FLASH_VAULT_B_OFF;
 }

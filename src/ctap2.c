@@ -22,6 +22,7 @@
 #include "fdo.h"
 #include "indicator.h"
 #include "cred_alg.h"
+#include <stddef.h>
 #include "cred_store.h"
 #include "puf_sram.h"
 #include "wolfssl/wolfcrypt/puf.h"
@@ -69,7 +70,15 @@ extern void ForceZero(void* mem, word32 len);
 #define COSE_CRV_P256 1
 #define COSE_ALG_ECDH_ES_HKDF256 -25
 
-#define FLASH_PIN_OFF      0x73000
+/* Two sectors, written alternately. A single sector must be erased before it
+ * can be reprogrammed, and that erase-then-program window is not atomic: a
+ * power cut inside it used to leave no magic at all, which pin_state_load()
+ * reads as "no PIN configured". That fails OPEN -- PIN protection silently
+ * disappears -- and a hostile USB power source can retry the cut at will.
+ * Alternating sectors means the previous good copy survives any interruption.
+ */
+#define FLASH_PIN_A_OFF    0x73000
+#define FLASH_PIN_B_OFF    0x76000
 #define FLASH_PIN_MAGIC    0x50494E21 /* 'PIN!' */
 #define PIN_MAX_RETRIES    8
 #define FLASH_RK_OFF       0x74000
@@ -222,13 +231,17 @@ static int ct_memeq(const uint8_t *a, const uint8_t *b, uint16_t len)
 
 struct pin_state {
     uint32_t magic;
+    uint32_t seq;          /* higher wins; distinguishes the two copies */
     uint8_t pin_hash[HASH_SZ];
     uint8_t retries;
     uint8_t reserved[3];
+    uint8_t check[8];      /* truncated SHA-256, detects a torn write */
 };
 
 static struct pin_state pin_store;
 static bool pin_loaded = false;
+/* Offset the live copy came from; the next save goes to the other one. */
+static uint32_t pin_cur_off = FLASH_PIN_A_OFF;
 static bool pin_token_valid = false;
 /* Consecutive pinAuth (token) failures. RAM only and reset on success; see
  * pin_require_for_op().
@@ -252,28 +265,67 @@ static void pin_state_reset(void)
     ForceZero(pin_token, sizeof(pin_token));
     pin_agree_valid = false;
     pin_agree_consumed = true;
-    fidelio_flash_erase(FLASH_PIN_OFF, FLASH_SECTOR_SIZE);
+    fidelio_flash_erase(FLASH_PIN_A_OFF, FLASH_SECTOR_SIZE);
+    fidelio_flash_erase(FLASH_PIN_B_OFF, FLASH_SECTOR_SIZE);
+    pin_cur_off = FLASH_PIN_B_OFF;
+}
+
+/* Integrity marker over everything preceding it, so a half-programmed copy is
+ * rejected rather than believed. It is not a forgery defence: an attacker who
+ * can rewrite flash can recompute it. It only has to catch torn writes.
+ */
+static void pin_state_check(const struct pin_state *st, uint8_t *out)
+{
+    uint8_t digest[HASH_SZ];
+    wc_Sha256Hash((const byte *)st, offsetof(struct pin_state, check), digest);
+    memcpy(out, digest, 8);
+    ForceZero(digest, sizeof(digest));
+}
+
+static bool pin_state_valid(const struct pin_state *st)
+{
+    uint8_t want[8];
+    if (st->magic != FLASH_PIN_MAGIC)
+        return false;
+    pin_state_check(st, want);
+    return memcmp(want, st->check, 8) == 0;
 }
 
 static void pin_state_load(void)
 {
+    const struct pin_state *a = (const struct pin_state *)(XIP_BASE + FLASH_PIN_A_OFF);
+    const struct pin_state *b = (const struct pin_state *)(XIP_BASE + FLASH_PIN_B_OFF);
+    bool va, vb;
+
     if (pin_loaded)
         return;
-    const struct pin_state *flash_pin = (const struct pin_state *)(XIP_BASE + FLASH_PIN_OFF);
-    if (flash_pin->magic == FLASH_PIN_MAGIC) {
-        memcpy(&pin_store, flash_pin, sizeof(pin_store));
+    va = pin_state_valid(a);
+    vb = pin_state_valid(b);
+
+    if (va && (!vb || (int32_t)(a->seq - b->seq) > 0)) {
+        memcpy(&pin_store, a, sizeof(pin_store));
+        pin_cur_off = FLASH_PIN_A_OFF;
+    } else if (vb) {
+        memcpy(&pin_store, b, sizeof(pin_store));
+        pin_cur_off = FLASH_PIN_B_OFF;
     } else {
         memset(&pin_store, 0, sizeof(pin_store));
         pin_store.retries = PIN_MAX_RETRIES;
+        pin_cur_off = FLASH_PIN_B_OFF; /* so the first save lands in A */
     }
     pin_loaded = true;
 }
 
 static void pin_state_save(void)
 {
+    uint32_t target = (pin_cur_off == FLASH_PIN_A_OFF) ? FLASH_PIN_B_OFF
+                                                       : FLASH_PIN_A_OFF;
     pin_store.magic = FLASH_PIN_MAGIC;
-    fidelio_flash_erase(FLASH_PIN_OFF, FLASH_SECTOR_SIZE);
-    fidelio_flash_program(FLASH_PIN_OFF, (const uint8_t *)&pin_store, sizeof(pin_store));
+    pin_store.seq++;
+    pin_state_check(&pin_store, pin_store.check);
+    fidelio_flash_erase(target, FLASH_SECTOR_SIZE);
+    fidelio_flash_program(target, (const uint8_t *)&pin_store, sizeof(pin_store));
+    pin_cur_off = target;
 }
 
 static void pin_reset_token(WC_RNG *rng)
