@@ -1090,8 +1090,10 @@ static int parse_getassert(const uint8_t *buf, uint16_t len, struct ga_params *o
         return -1;
     if (out->hmac_secret_requested && !out->hmac_secret_valid)
         return -1;
-    if (!out->allow_rk && (!out->cred_id || out->cred_id_len == 0) && out->allow_list_len == 0)
-        return -1;
+    /* An absent allowList is not an error: it is how a relying party asks
+     * for a discoverable credential. Only an explicitly present but
+     * unparseable list is a problem, and that is caught above.
+     */
     return 0;
 }
 
