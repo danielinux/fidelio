@@ -202,6 +202,20 @@ static int write_error(uint8_t code, uint8_t *reply, uint16_t *reply_len)
 }
 
 /* --- Crypto/credential helpers --- */
+/* Constant-time equality for anything an attacker can iterate against: PIN
+ * hashes, pinAuth and hmac-secret MACs, and credential tags. A plain memcmp
+ * returns early on the first differing byte, which leaks how much of a guess
+ * was correct and turns an exhaustive search into a per-byte one.
+ */
+static int ct_memeq(const uint8_t *a, const uint8_t *b, uint16_t len)
+{
+    uint8_t diff = 0;
+    uint16_t i;
+    for (i = 0; i < len; i++)
+        diff |= (uint8_t)(a[i] ^ b[i]);
+    return diff == 0;
+}
+
 struct pin_state {
     uint32_t magic;
     uint8_t pin_hash[HASH_SZ];
@@ -212,6 +226,11 @@ struct pin_state {
 static struct pin_state pin_store;
 static bool pin_loaded = false;
 static bool pin_token_valid = false;
+/* Consecutive pinAuth (token) failures. RAM only and reset on success; see
+ * pin_require_for_op().
+ */
+#define PIN_AUTH_MAX_FAILS 3
+static uint8_t pin_auth_fails = 0;
 static uint8_t pin_token[32];
 
 static ecc_key pin_agree_key;
@@ -287,6 +306,8 @@ static void pin_state_reset(void)
     memset(&pin_store, 0, sizeof(pin_store));
     pin_loaded = false;
     pin_token_valid = false;
+    pin_auth_fails = 0;
+    ForceZero(pin_token, sizeof(pin_token));
     pin_agree_valid = false;
     pin_agree_consumed = true;
     fidelio_flash_erase(FLASH_PIN_OFF, FLASH_SECTOR_SIZE);
@@ -324,6 +345,7 @@ static void pin_reset_token(WC_RNG *rng)
 {
     wc_RNG_GenerateBlock(rng, pin_token, sizeof(pin_token));
     pin_token_valid = true;
+    pin_auth_fails = 0;
 }
 
 static int pin_generate_agreement_key(WC_RNG *rng)
@@ -425,18 +447,28 @@ static int pin_hash_plain(const uint8_t *pin, uint16_t pin_len, uint8_t *hash_ou
     return wc_Sha256Hash(pin, pin_len, hash_out);
 }
 
-static int pin_check_retries(void)
+/* Spend a retry BEFORE checking the guess, and persist it immediately.
+ *
+ * Decrementing afterwards is exploitable: an attacker sends a wrong PIN and
+ * cuts power the moment the device starts responding, so the flash write
+ * never lands and the counter never moves. Repeat for unlimited guesses.
+ * Charging the attempt up front makes a power cut cost a retry rather than
+ * refund one. pin_restore_retries() gives them back only on success.
+ */
+static int pin_spend_retry(void)
 {
     pin_state_load();
     if (pin_store.retries == 0)
         return -1;
+    pin_store.retries--;
+    pin_state_save();
     return 0;
 }
 
-static void pin_fail_retry(void)
+static void pin_restore_retries(void)
 {
-    if (pin_store.retries > 0) {
-        pin_store.retries--;
+    if (pin_store.retries != PIN_MAX_RETRIES) {
+        pin_store.retries = PIN_MAX_RETRIES;
         pin_state_save();
     }
 }
@@ -469,10 +501,22 @@ static int pin_require_for_op(const uint8_t *pin_auth, uint32_t pin_auth_len,
     wc_HmacUpdate(&hmac, cdh, cdh_len);
     wc_HmacFinal(&hmac, mac);
     wc_HmacFree(&hmac);
-    if (memcmp(mac, pin_auth, 16) != 0) {
-        pin_fail_retry();
+    if (!ct_memeq(mac, pin_auth, 16)) {
+        ForceZero(mac, sizeof(mac));
+        /* This checks pinAuth against the pinToken, not the PIN, so it must
+         * NOT spend a persistent PIN retry: that counter guards PIN entry.
+         * CTAP2 instead drops the token after repeated failures, forcing the
+         * platform to prove the PIN again. Keeping the count in RAM also
+         * avoids two flash sector erases on every authenticated operation.
+         */
+        if (++pin_auth_fails >= PIN_AUTH_MAX_FAILS) {
+            pin_token_valid = false;
+            pin_auth_fails = 0;
+        }
         return CTAP2_ERR_PIN_AUTH_INVALID;
     }
+    ForceZero(mac, sizeof(mac));
+    pin_auth_fails = 0;
     if (verified)
         *verified = true;
     return 0;
@@ -498,18 +542,6 @@ static int cred_tag(uint8_t alg_id, const uint8_t *rpIdHash,
     }
     wc_HmacFree(&hmac);
     return (ret == 0) ? 0 : -1;
-}
-
-/* Constant-time compare: the tag check gates credential validity, so an
- * early-exit memcmp would leak how much of a forged tag was correct.
- */
-static int ct_memeq(const uint8_t *a, const uint8_t *b, uint16_t len)
-{
-    uint8_t diff = 0;
-    uint16_t i;
-    for (i = 0; i < len; i++)
-        diff |= (uint8_t)(a[i] ^ b[i]);
-    return diff == 0;
 }
 
 /* Validate a credential ID against this relying party and, if it checks out,
@@ -1524,48 +1556,69 @@ static int ctap2_get_assertion(const uint8_t *payload, uint16_t payload_len,
         Aes aes;
         Hmac hmac;
 
-        if (!params.hmac_secret_valid) { ret = CTAP2_ERR_INVALID_CBOR; goto ga_cleanup; }
-        if (pin_shared_secret(params.hs_platform_qx, params.hs_platform_qy, shared) != 0) { ret = CTAP2_ERR_PIN_AUTH_INVALID; goto ga_cleanup; }
+        /* Every exit below, the error jumps included, must scrub these: they
+         * hold the ECDH shared secret, the plaintext salts and the
+         * per-credential seed. Previously only the success path did, so any
+         * failure left them live on the stack for whatever ran next.
+         */
+        #define hs_fail(code) do { \
+            ForceZero(shared, sizeof(shared)); \
+            ForceZero(salt_dec, sizeof(salt_dec)); \
+            ForceZero(hs_output, sizeof(hs_output)); \
+            ForceZero(mac, sizeof(mac)); \
+            ForceZero(cred_random, sizeof(cred_random)); \
+            ret = (code); goto ga_cleanup; \
+        } while (0)
 
-        if (wc_HmacInit(&hmac, NULL, 0) != 0) { ret = CTAP2_ERR_PIN_AUTH_INVALID; goto ga_cleanup; }
-        if (wc_HmacSetKey(&hmac, SHA256, shared, HASH_SZ) != 0) { wc_HmacFree(&hmac); ret = CTAP2_ERR_PIN_AUTH_INVALID; goto ga_cleanup; }
+        memset(shared, 0, sizeof(shared));
+        memset(salt_dec, 0, sizeof(salt_dec));
+        memset(hs_output, 0, sizeof(hs_output));
+        memset(mac, 0, sizeof(mac));
+        memset(cred_random, 0, sizeof(cred_random));
+
+        if (!params.hmac_secret_valid) { hs_fail(CTAP2_ERR_INVALID_CBOR); }
+        if (pin_shared_secret(params.hs_platform_qx, params.hs_platform_qy, shared) != 0) { hs_fail(CTAP2_ERR_PIN_AUTH_INVALID); }
+
+        if (wc_HmacInit(&hmac, NULL, 0) != 0) { hs_fail(CTAP2_ERR_PIN_AUTH_INVALID); }
+        if (wc_HmacSetKey(&hmac, SHA256, shared, HASH_SZ) != 0) { wc_HmacFree(&hmac); hs_fail(CTAP2_ERR_PIN_AUTH_INVALID); }
         wc_HmacUpdate(&hmac, params.hs_salt_enc, params.hs_salt_enc_len);
         wc_HmacFinal(&hmac, mac);
         wc_HmacFree(&hmac);
-        if (memcmp(mac, params.hs_salt_auth, 16) != 0) { ret = CTAP2_ERR_PIN_AUTH_INVALID; goto ga_cleanup; }
+        if (!ct_memeq(mac, params.hs_salt_auth, 16)) { hs_fail(CTAP2_ERR_PIN_AUTH_INVALID); }
 
-        if (wc_AesInit(&aes, NULL, INVALID_DEVID) != 0) { ret = CTAP2_ERR_PIN_AUTH_INVALID; goto ga_cleanup; }
-        if (wc_AesSetKey(&aes, shared + HASH_SZ, 32, iv, AES_DECRYPTION) != 0) { wc_AesFree(&aes); ret = CTAP2_ERR_PIN_AUTH_INVALID; goto ga_cleanup; }
-        if (wc_AesCbcDecrypt(&aes, salt_dec, params.hs_salt_enc, params.hs_salt_enc_len) != 0) { wc_AesFree(&aes); ret = CTAP2_ERR_PIN_AUTH_INVALID; goto ga_cleanup; }
+        if (wc_AesInit(&aes, NULL, INVALID_DEVID) != 0) { hs_fail(CTAP2_ERR_PIN_AUTH_INVALID); }
+        if (wc_AesSetKey(&aes, shared + HASH_SZ, 32, iv, AES_DECRYPTION) != 0) { wc_AesFree(&aes); hs_fail(CTAP2_ERR_PIN_AUTH_INVALID); }
+        if (wc_AesCbcDecrypt(&aes, salt_dec, params.hs_salt_enc, params.hs_salt_enc_len) != 0) { wc_AesFree(&aes); hs_fail(CTAP2_ERR_PIN_AUTH_INVALID); }
         wc_AesFree(&aes);
 
-        if (derive_cred_random(rpIdHash, params.cred_id, (uint16_t)params.cred_id_len, cred_random) != 0) { ret = CTAP2_ERR_INVALID_COMMAND; goto ga_cleanup; }
+        if (derive_cred_random(rpIdHash, params.cred_id, (uint16_t)params.cred_id_len, cred_random) != 0) { hs_fail(CTAP2_ERR_INVALID_COMMAND); }
         uint16_t salt_blocks = (uint16_t)(params.hs_salt_enc_len / 32);
         for (uint16_t i = 0; i < salt_blocks; i++) {
-            if (wc_HmacInit(&hmac, NULL, 0) != 0) { ret = CTAP2_ERR_INVALID_COMMAND; goto ga_cleanup; }
-            if (wc_HmacSetKey(&hmac, SHA256, cred_random, HASH_SZ) != 0) { wc_HmacFree(&hmac); ret = CTAP2_ERR_INVALID_COMMAND; goto ga_cleanup; }
+            if (wc_HmacInit(&hmac, NULL, 0) != 0) { hs_fail(CTAP2_ERR_INVALID_COMMAND); }
+            if (wc_HmacSetKey(&hmac, SHA256, cred_random, HASH_SZ) != 0) { wc_HmacFree(&hmac); hs_fail(CTAP2_ERR_INVALID_COMMAND); }
             wc_HmacUpdate(&hmac, salt_dec + (i * 32), 32);
             wc_HmacFinal(&hmac, hs_output + (i * 32));
             wc_HmacFree(&hmac);
         }
 
-        if (wc_AesInit(&aes, NULL, INVALID_DEVID) != 0) { ret = CTAP2_ERR_INVALID_COMMAND; goto ga_cleanup; }
+        if (wc_AesInit(&aes, NULL, INVALID_DEVID) != 0) { hs_fail(CTAP2_ERR_INVALID_COMMAND); }
         memset(iv, 0, sizeof(iv));
-        if (wc_AesSetKey(&aes, shared + HASH_SZ, 32, iv, AES_ENCRYPTION) != 0) { wc_AesFree(&aes); ret = CTAP2_ERR_INVALID_COMMAND; goto ga_cleanup; }
-        if (wc_AesCbcEncrypt(&aes, salt_dec, hs_output, params.hs_salt_enc_len) != 0) { wc_AesFree(&aes); ret = CTAP2_ERR_INVALID_COMMAND; goto ga_cleanup; }
+        if (wc_AesSetKey(&aes, shared + HASH_SZ, 32, iv, AES_ENCRYPTION) != 0) { wc_AesFree(&aes); hs_fail(CTAP2_ERR_INVALID_COMMAND); }
+        if (wc_AesCbcEncrypt(&aes, salt_dec, hs_output, params.hs_salt_enc_len) != 0) { wc_AesFree(&aes); hs_fail(CTAP2_ERR_INVALID_COMMAND); }
         wc_AesFree(&aes);
 
         WOLFCOSE_CBOR_CTX ext;
         cbor_enc_init(&ext, ext_buf, sizeof(ext_buf), 0);
-        if (wc_CBOR_EncodeMapStart(&ext, 1) != 0) { ret = CTAP2_ERR_INVALID_COMMAND; goto ga_cleanup; }
-        if (cbor_put_text(&ext, "hmac-secret") != 0) { ret = CTAP2_ERR_INVALID_COMMAND; goto ga_cleanup; }
-        if (wc_CBOR_EncodeBstr(&ext, salt_dec, params.hs_salt_enc_len) != 0) { ret = CTAP2_ERR_INVALID_COMMAND; goto ga_cleanup; }
+        if (wc_CBOR_EncodeMapStart(&ext, 1) != 0) { hs_fail(CTAP2_ERR_INVALID_COMMAND); }
+        if (cbor_put_text(&ext, "hmac-secret") != 0) { hs_fail(CTAP2_ERR_INVALID_COMMAND); }
+        if (wc_CBOR_EncodeBstr(&ext, salt_dec, params.hs_salt_enc_len) != 0) { hs_fail(CTAP2_ERR_INVALID_COMMAND); }
         ext_len = (uint16_t)ext.idx;
         ForceZero(shared, sizeof(shared));
         ForceZero(mac, sizeof(mac));
         ForceZero(cred_random, sizeof(cred_random));
         ForceZero(hs_output, sizeof(hs_output));
         ForceZero(salt_dec, sizeof(salt_dec));
+        #undef hs_fail
     }
 
     if (build_authdata_assert(rpIdHash, flags, device_get_counter(),
@@ -1622,7 +1675,15 @@ ga_cleanup:
     return 0;
 }
 
-static int ctap2_client_pin(const uint8_t *payload, uint16_t payload_len,
+/* The clientPIN handler has around twenty exit paths, and these hold the
+ * ECDH shared secret and the decrypted PIN. Keeping them at file scope lets
+ * the wrapper below scrub them on every one of those paths, including the
+ * error returns, rather than relying on each to remember.
+ */
+static uint8_t pin_shared[HASH_SZ * 2]; /* 32-byte HMAC key + 32-byte AES key */
+static uint8_t pin_tmp[64];
+
+static int ctap2_client_pin_inner(const uint8_t *payload, uint16_t payload_len,
                             uint8_t *reply, uint16_t reply_max, uint16_t *reply_len)
 {
     WOLFCOSE_CBOR_CTX c;
@@ -1633,8 +1694,6 @@ static int ctap2_client_pin(const uint8_t *payload, uint16_t payload_len,
     const uint8_t *newPinEnc = NULL; uint32_t newPinEnc_len = 0;
     const uint8_t *pinHashEnc = NULL; uint32_t pinHashEnc_len = 0;
     uint8_t platform_qx[ECC_SZ], platform_qy[ECC_SZ];
-    uint8_t shared[HASH_SZ * 2]; /* HKDF output: 32-byte HMAC key + 32-byte AES key */
-    uint8_t tmp[64];
     Hmac hmac;
     WC_RNG rng;
     int ret = 0;
@@ -1728,16 +1787,16 @@ static int ctap2_client_pin(const uint8_t *payload, uint16_t payload_len,
             if (!pin_auth || pin_auth_len != 16 || !newPinEnc || newPinEnc_len != 64) {
                 reply[0] = CTAP2_ERR_INVALID_LENGTH; *reply_len = 1; return 0;
             }
-            if (pin_shared_secret(platform_qx, platform_qy, shared) != 0) {
+            if (pin_shared_secret(platform_qx, platform_qy, pin_shared) != 0) {
                 reply[0] = CTAP2_ERR_PIN_AUTH_INVALID; *reply_len = 1; return 0;
             }
             /* pinAuth = LEFT(HMAC(sharedSecret[0:32], newPinEnc), 16) */
             if (wc_HmacInit(&hmac, NULL, 0) != 0) { return write_error(CTAP2_ERR_PIN_AUTH_INVALID, reply, reply_len); }
-            if (wc_HmacSetKey(&hmac, SHA256, shared, HASH_SZ) != 0) { wc_HmacFree(&hmac); return write_error(CTAP2_ERR_PIN_AUTH_INVALID, reply, reply_len); }
+            if (wc_HmacSetKey(&hmac, SHA256, pin_shared, HASH_SZ) != 0) { wc_HmacFree(&hmac); return write_error(CTAP2_ERR_PIN_AUTH_INVALID, reply, reply_len); }
             wc_HmacUpdate(&hmac, newPinEnc, newPinEnc_len);
-            wc_HmacFinal(&hmac, tmp);
+            wc_HmacFinal(&hmac, pin_tmp);
             wc_HmacFree(&hmac);
-            if (memcmp(tmp, pin_auth, 16) != 0) {
+            if (!ct_memeq(pin_tmp, pin_auth, 16)) {
                 reply[0] = CTAP2_ERR_PIN_AUTH_INVALID; *reply_len = 1; return 0;
             }
             /* newPinEnc: AES-256-CBC(sharedSecret[32:], iv=0, padded PIN, 64 bytes) */
@@ -1745,21 +1804,20 @@ static int ctap2_client_pin(const uint8_t *payload, uint16_t payload_len,
                 Aes aes;
                 uint8_t iv[16] = {0};
                 if (wc_AesInit(&aes, NULL, INVALID_DEVID) != 0) { reply[0] = CTAP2_ERR_PIN_AUTH_INVALID; *reply_len = 1; return 0; }
-                if (wc_AesSetKey(&aes, shared + 32, 32, iv, AES_DECRYPTION) != 0) { wc_AesFree(&aes); reply[0] = CTAP2_ERR_PIN_AUTH_INVALID; *reply_len = 1; return 0; }
-                if (wc_AesCbcDecrypt(&aes, tmp, newPinEnc, newPinEnc_len) != 0) { wc_AesFree(&aes); reply[0] = CTAP2_ERR_PIN_AUTH_INVALID; *reply_len = 1; return 0; }
+                if (wc_AesSetKey(&aes, pin_shared + 32, 32, iv, AES_DECRYPTION) != 0) { wc_AesFree(&aes); reply[0] = CTAP2_ERR_PIN_AUTH_INVALID; *reply_len = 1; return 0; }
+                if (wc_AesCbcDecrypt(&aes, pin_tmp, newPinEnc, newPinEnc_len) != 0) { wc_AesFree(&aes); reply[0] = CTAP2_ERR_PIN_AUTH_INVALID; *reply_len = 1; return 0; }
                 wc_AesFree(&aes);
             }
             /* derive hash */
             uint16_t pin_len = 0;
             for (int i = 0; i < 64; i++) {
-                if (tmp[i] == 0) { pin_len = (uint16_t)i; break; }
+                if (pin_tmp[i] == 0) { pin_len = (uint16_t)i; break; }
             }
             if (pin_len == 0) pin_len = 64;
-            if (pin_hash_plain(tmp, pin_len, pin_store.pin_hash) != 0) {
+            if (pin_hash_plain(pin_tmp, pin_len, pin_store.pin_hash) != 0) {
                 reply[0] = CTAP2_ERR_PIN_AUTH_INVALID; *reply_len = 1; return 0;
             }
-            pin_store.retries = PIN_MAX_RETRIES;
-            pin_state_save();
+            pin_restore_retries();
             wc_InitRng(&rng);
             pin_reset_token(&rng);
             wc_FreeRng(&rng);
@@ -1774,7 +1832,7 @@ static int ctap2_client_pin(const uint8_t *payload, uint16_t payload_len,
             if (pin_store.magic != FLASH_PIN_MAGIC) {
                 reply[0] = CTAP2_ERR_PIN_NOT_SET; *reply_len = 1; return 0;
             }
-            if (pin_check_retries() != 0) {
+            if (pin_spend_retry() != 0) {
                 reply[0] = CTAP2_ERR_PIN_BLOCKED; *reply_len = 1; return 0;
             }
             if (!key_agree || !pin_agree_valid || parse_cose_pubkey(key_agree, key_agree_len, platform_qx, platform_qy) != 0) {
@@ -1783,7 +1841,7 @@ static int ctap2_client_pin(const uint8_t *payload, uint16_t payload_len,
             if (!pin_auth || pin_auth_len != 16 || !newPinEnc || newPinEnc_len != 64 || !pinHashEnc || pinHashEnc_len != 16) {
                 reply[0] = CTAP2_ERR_INVALID_LENGTH; *reply_len = 1; return 0;
             }
-            if (pin_shared_secret(platform_qx, platform_qy, shared) != 0) {
+            if (pin_shared_secret(platform_qx, platform_qy, pin_shared) != 0) {
                 return write_error(CTAP2_ERR_PIN_AUTH_INVALID, reply, reply_len);
             }
             /* pinHashEnc: AES-256-CBC(sharedSecret[32:], iv=0, LEFT(SHA256(PIN),16)) */
@@ -1791,23 +1849,25 @@ static int ctap2_client_pin(const uint8_t *payload, uint16_t payload_len,
                 Aes aes;
                 uint8_t iv[16] = {0};
                 if (wc_AesInit(&aes, NULL, INVALID_DEVID) != 0) { return write_error(CTAP2_ERR_PIN_AUTH_INVALID, reply, reply_len); }
-                if (wc_AesSetKey(&aes, shared + 32, 32, iv, AES_DECRYPTION) != 0) { wc_AesFree(&aes); return write_error(CTAP2_ERR_PIN_AUTH_INVALID, reply, reply_len); }
-                if (wc_AesCbcDecrypt(&aes, tmp, pinHashEnc, pinHashEnc_len) != 0) { wc_AesFree(&aes); return write_error(CTAP2_ERR_PIN_AUTH_INVALID, reply, reply_len); }
+                if (wc_AesSetKey(&aes, pin_shared + 32, 32, iv, AES_DECRYPTION) != 0) { wc_AesFree(&aes); return write_error(CTAP2_ERR_PIN_AUTH_INVALID, reply, reply_len); }
+                if (wc_AesCbcDecrypt(&aes, pin_tmp, pinHashEnc, pinHashEnc_len) != 0) { wc_AesFree(&aes); return write_error(CTAP2_ERR_PIN_AUTH_INVALID, reply, reply_len); }
                 wc_AesFree(&aes);
             }
-            if (memcmp(tmp, pin_store.pin_hash, 16) != 0) {
-                pin_fail_retry();
+            if (!ct_memeq(pin_tmp, pin_store.pin_hash, 16)) {
+                ForceZero(pin_tmp, sizeof(pin_tmp));
+                ForceZero(pin_shared, sizeof(pin_shared));
                 reply[0] = CTAP2_ERR_PIN_INVALID; *reply_len = 1; return 0;
             }
             if (wc_HmacInit(&hmac, NULL, 0) != 0) { return write_error(CTAP2_ERR_PIN_AUTH_INVALID, reply, reply_len); }
-            if (wc_HmacSetKey(&hmac, SHA256, shared, HASH_SZ) != 0) { wc_HmacFree(&hmac); return write_error(CTAP2_ERR_PIN_AUTH_INVALID, reply, reply_len); }
+            if (wc_HmacSetKey(&hmac, SHA256, pin_shared, HASH_SZ) != 0) { wc_HmacFree(&hmac); return write_error(CTAP2_ERR_PIN_AUTH_INVALID, reply, reply_len); }
             wc_HmacUpdate(&hmac, newPinEnc, newPinEnc_len);
             /* For changePIN, the auth covers both the new PIN and the old hash */
             wc_HmacUpdate(&hmac, pinHashEnc, pinHashEnc_len);
-            wc_HmacFinal(&hmac, tmp);
+            wc_HmacFinal(&hmac, pin_tmp);
             wc_HmacFree(&hmac);
-            if (memcmp(tmp, pin_auth, 16) != 0) {
-                pin_fail_retry();
+            if (!ct_memeq(pin_tmp, pin_auth, 16)) {
+                ForceZero(pin_tmp, sizeof(pin_tmp));
+                ForceZero(pin_shared, sizeof(pin_shared));
                 return write_error(CTAP2_ERR_PIN_AUTH_INVALID, reply, reply_len);
             }
             /* Decrypt newPinEnc (IV=0) */
@@ -1815,20 +1875,19 @@ static int ctap2_client_pin(const uint8_t *payload, uint16_t payload_len,
                 Aes aes;
                 uint8_t iv[16] = {0};
                 if (wc_AesInit(&aes, NULL, INVALID_DEVID) != 0) { return write_error(CTAP2_ERR_PIN_AUTH_INVALID, reply, reply_len); }
-                if (wc_AesSetKey(&aes, shared + 32, 32, iv, AES_DECRYPTION) != 0) { wc_AesFree(&aes); return write_error(CTAP2_ERR_PIN_AUTH_INVALID, reply, reply_len); }
-                if (wc_AesCbcDecrypt(&aes, tmp, newPinEnc, newPinEnc_len) != 0) { wc_AesFree(&aes); return write_error(CTAP2_ERR_PIN_AUTH_INVALID, reply, reply_len); }
+                if (wc_AesSetKey(&aes, pin_shared + 32, 32, iv, AES_DECRYPTION) != 0) { wc_AesFree(&aes); return write_error(CTAP2_ERR_PIN_AUTH_INVALID, reply, reply_len); }
+                if (wc_AesCbcDecrypt(&aes, pin_tmp, newPinEnc, newPinEnc_len) != 0) { wc_AesFree(&aes); return write_error(CTAP2_ERR_PIN_AUTH_INVALID, reply, reply_len); }
                 wc_AesFree(&aes);
             }
             uint16_t pin_len = 0;
             for (int i = 0; i < 64; i++) {
-                if (tmp[i] == 0) { pin_len = (uint16_t)i; break; }
+                if (pin_tmp[i] == 0) { pin_len = (uint16_t)i; break; }
             }
             if (pin_len == 0) pin_len = 64;
-            if (pin_hash_plain(tmp, pin_len, pin_store.pin_hash) != 0) {
+            if (pin_hash_plain(pin_tmp, pin_len, pin_store.pin_hash) != 0) {
                 reply[0] = CTAP2_ERR_PIN_AUTH_INVALID; *reply_len = 1; return 0;
             }
-            pin_store.retries = PIN_MAX_RETRIES;
-            pin_state_save();
+            pin_restore_retries();
             wc_InitRng(&rng);
             pin_reset_token(&rng);
             wc_FreeRng(&rng);
@@ -1843,7 +1902,7 @@ static int ctap2_client_pin(const uint8_t *payload, uint16_t payload_len,
             if (pin_store.magic != FLASH_PIN_MAGIC) {
                 reply[0] = CTAP2_ERR_PIN_NOT_SET; *reply_len = 1; return 0;
             }
-            if (pin_check_retries() != 0) {
+            if (pin_spend_retry() != 0) {
                 reply[0] = CTAP2_ERR_PIN_BLOCKED; *reply_len = 1; return 0;
             }
             if (!key_agree || !pin_agree_valid || parse_cose_pubkey(key_agree, key_agree_len, platform_qx, platform_qy) != 0) {
@@ -1852,7 +1911,7 @@ static int ctap2_client_pin(const uint8_t *payload, uint16_t payload_len,
             if (!pinHashEnc || pinHashEnc_len != 16) {
                 reply[0] = CTAP2_ERR_INVALID_LENGTH; *reply_len = 1; return 0;
             }
-            if (pin_shared_secret(platform_qx, platform_qy, shared) != 0) {
+            if (pin_shared_secret(platform_qx, platform_qy, pin_shared) != 0) {
                 reply[0] = CTAP2_ERR_PIN_AUTH_INVALID; *reply_len = 1; return 0;
             }
             /* pinHashEnc for protocol 1 is a single AES block with IV=0. */
@@ -1860,33 +1919,33 @@ static int ctap2_client_pin(const uint8_t *payload, uint16_t payload_len,
                 Aes aes;
                 uint8_t iv[16] = {0};
                 if (wc_AesInit(&aes, NULL, INVALID_DEVID) != 0) { reply[0] = CTAP2_ERR_PIN_AUTH_INVALID; *reply_len = 1; return 0; }
-                if (wc_AesSetKey(&aes, shared + 32, 32, iv, AES_DECRYPTION) != 0) { wc_AesFree(&aes); reply[0] = CTAP2_ERR_PIN_AUTH_INVALID; *reply_len = 1; return 0; }
-                if (wc_AesCbcDecrypt(&aes, tmp, pinHashEnc, pinHashEnc_len) != 0) { wc_AesFree(&aes); reply[0] = CTAP2_ERR_PIN_AUTH_INVALID; *reply_len = 1; return 0; }
+                if (wc_AesSetKey(&aes, pin_shared + 32, 32, iv, AES_DECRYPTION) != 0) { wc_AesFree(&aes); reply[0] = CTAP2_ERR_PIN_AUTH_INVALID; *reply_len = 1; return 0; }
+                if (wc_AesCbcDecrypt(&aes, pin_tmp, pinHashEnc, pinHashEnc_len) != 0) { wc_AesFree(&aes); reply[0] = CTAP2_ERR_PIN_AUTH_INVALID; *reply_len = 1; return 0; }
                 wc_AesFree(&aes);
             }
-            if (memcmp(tmp, pin_store.pin_hash, 16) != 0) {
-                pin_fail_retry();
+            if (!ct_memeq(pin_tmp, pin_store.pin_hash, 16)) {
+                ForceZero(pin_tmp, sizeof(pin_tmp));
+                ForceZero(pin_shared, sizeof(pin_shared));
                 reply[0] = CTAP2_ERR_PIN_INVALID; *reply_len = 1; return 0;
             }
             wc_InitRng(&rng);
             pin_reset_token(&rng);
-            pin_store.retries = PIN_MAX_RETRIES;
-            pin_state_save();
+            pin_restore_retries();
             /* Encrypt pinToken with AES-256-CBC, IV=0, no IV prefix (protocol 1). */
             {
                 Aes aes;
                 uint8_t iv[16] = {0};
                 uint16_t enc_len = sizeof(pin_token);
                 if (wc_AesInit(&aes, NULL, INVALID_DEVID) != 0) { wc_FreeRng(&rng); reply[0] = CTAP2_ERR_PIN_AUTH_INVALID; *reply_len = 1; return 0; }
-                if (wc_AesSetKey(&aes, shared + 32, 32, iv, AES_ENCRYPTION) != 0) { wc_AesFree(&aes); wc_FreeRng(&rng); reply[0] = CTAP2_ERR_PIN_AUTH_INVALID; *reply_len = 1; return 0; }
-                if (wc_AesCbcEncrypt(&aes, tmp, pin_token, sizeof(pin_token)) != 0) { wc_AesFree(&aes); wc_FreeRng(&rng); reply[0] = CTAP2_ERR_PIN_AUTH_INVALID; *reply_len = 1; return 0; }
+                if (wc_AesSetKey(&aes, pin_shared + 32, 32, iv, AES_ENCRYPTION) != 0) { wc_AesFree(&aes); wc_FreeRng(&rng); reply[0] = CTAP2_ERR_PIN_AUTH_INVALID; *reply_len = 1; return 0; }
+                if (wc_AesCbcEncrypt(&aes, pin_tmp, pin_token, sizeof(pin_token)) != 0) { wc_AesFree(&aes); wc_FreeRng(&rng); reply[0] = CTAP2_ERR_PIN_AUTH_INVALID; *reply_len = 1; return 0; }
                 wc_AesFree(&aes);
                 WOLFCOSE_CBOR_CTX rc;
                 cbor_enc_init(&rc, reply, reply_max, 1);
                 reply[0] = CTAP2_ERR_SUCCESS;
                 if (wc_CBOR_EncodeMapStart(&rc, 1) != 0) { wc_FreeRng(&rng); return -1; }
                 if (wc_CBOR_EncodeUint(&rc, 2) != 0) { wc_FreeRng(&rng); return -1; }
-                if (wc_CBOR_EncodeBstr(&rc, tmp, enc_len) != 0) { wc_FreeRng(&rng); return -1; }
+                if (wc_CBOR_EncodeBstr(&rc, pin_tmp, enc_len) != 0) { wc_FreeRng(&rng); return -1; }
                 *reply_len = (uint16_t)rc.idx;
                 wc_FreeRng(&rng);
                 return 0;
@@ -1897,6 +1956,17 @@ static int ctap2_client_pin(const uint8_t *payload, uint16_t payload_len,
             *reply_len = 1;
             return 0;
     }
+}
+
+static int ctap2_client_pin(const uint8_t *payload, uint16_t payload_len,
+                            uint8_t *reply, uint16_t reply_max,
+                            uint16_t *reply_len)
+{
+    int ret = ctap2_client_pin_inner(payload, payload_len, reply, reply_max,
+                                     reply_len);
+    ForceZero(pin_shared, sizeof(pin_shared));
+    ForceZero(pin_tmp, sizeof(pin_tmp));
+    return ret;
 }
 
 void ctap2_reset_state(void)
