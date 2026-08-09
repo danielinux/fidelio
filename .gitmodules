@@ -4,3 +4,6 @@
 [submodule "pico-sdk"]
 	path = pico-sdk
 	url = https://github.com/raspberrypi/pico-sdk
+[submodule "lib/wolfcose"]
+	path = lib/wolfcose
+	url = https://github.com/wolfSSL/wolfCOSE

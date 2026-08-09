@@ -30,6 +30,8 @@ target_sources(${PROJECT} PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/src/indicator.c
         ${CMAKE_CURRENT_SOURCE_DIR}/src/usb_descriptors.c
         ${CMAKE_CURRENT_SOURCE_DIR}/src/sys_stubs.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/lib/wolfcose/src/wolfcose_cbor.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/lib/wolfcose/src/wolfcose.c
         ${CMAKE_CURRENT_SOURCE_DIR}/lib/wolfssl/wolfcrypt/src/asn.c
         ${CMAKE_CURRENT_SOURCE_DIR}/lib/wolfssl/wolfcrypt/src/wc_port.c
         ${CMAKE_CURRENT_SOURCE_DIR}/lib/wolfssl/wolfcrypt/src/wolfmath.c
@@ -58,10 +60,24 @@ target_sources(${PROJECT} PUBLIC
 target_include_directories(${PROJECT} PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/src
         ${CMAKE_CURRENT_SOURCE_DIR}/lib/wolfssl
+        ${CMAKE_CURRENT_SOURCE_DIR}/lib/wolfcose/include
         )
 
         target_compile_definitions( ${PROJECT} PUBLIC WOLFSSL_USER_SETTINGS)
 
+# wolfCOSE: Fidelio only needs the CBOR engine and COSE_Key serialisation.
+# Trim away every COSE message type so none of the sign/encrypt/MAC code is
+# linked in. WOLFCOSE_CBOR_ENCODE/DECODE and WOLFCOSE_KEY_ENCODE/DECODE stay
+# on by default.
+target_compile_definitions( ${PROJECT} PUBLIC
+        WOLFCOSE_LEAN
+        WOLFCOSE_NO_SIGN1
+        WOLFCOSE_NO_ENCRYPT0
+        WOLFCOSE_NO_MAC0
+        WOLFCOSE_NO_SIGN
+        WOLFCOSE_NO_ENCRYPT
+        WOLFCOSE_NO_MAC
+        )
 
 
         target_link_libraries(${PROJECT} PUBLIC pico_stdlib)

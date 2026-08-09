@@ -20,6 +20,7 @@
 #include "wolfssl/wolfcrypt/aes.h"
 #include "fdo.h"
 #include "indicator.h"
+#include "wolfcose/wolfcose.h"
 
 extern void ForceZero(void* mem, word32 len);
 
@@ -70,219 +71,110 @@ extern void ForceZero(void* mem, word32 len);
 
 #define CTAP2_CMD_RESET           0x07
 
-struct cbor_buf {
-    uint8_t *buf;
-    uint16_t cap;
-    uint16_t len;
-};
-
-static int cbor_put_type_val(struct cbor_buf *b, uint8_t major, uint32_t val)
+/* CBOR (RFC 8949) encoding and decoding is provided by wolfCOSE. The thin
+ * wrappers below only set up a WOLFCOSE_CBOR_CTX and keep the call sites
+ * readable; wolfCOSE returns WOLFCOSE_SUCCESS (0) or a negative error code,
+ * which matches the 0/-1 convention used throughout this file.
+ */
+static void cbor_enc_init(WOLFCOSE_CBOR_CTX *c, uint8_t *buf, uint16_t cap,
+                          uint16_t off)
 {
-    if (val < 24) {
-        if (b->len + 1 > b->cap) return -1;
-        b->buf[b->len++] = (uint8_t)((major << 5) | (uint8_t)val);
-        return 0;
-    } else if (val <= 0xFF) {
-        if (b->len + 2 > b->cap) return -1;
-        b->buf[b->len++] = (uint8_t)((major << 5) | 24);
-        b->buf[b->len++] = (uint8_t)val;
-        return 0;
-    } else if (val <= 0xFFFF) {
-        if (b->len + 3 > b->cap) return -1;
-        b->buf[b->len++] = (uint8_t)((major << 5) | 25);
-        b->buf[b->len++] = (uint8_t)(val >> 8);
-        b->buf[b->len++] = (uint8_t)(val & 0xFF);
-        return 0;
-    }
-    return -1;
+    c->buf = buf;
+    c->cbuf = NULL;
+    c->bufSz = cap;
+    c->idx = off;
 }
 
-static int cbor_put_uint(struct cbor_buf *b, uint32_t val)
+static void cbor_dec_init(WOLFCOSE_CBOR_CTX *c, const uint8_t *buf, uint16_t len)
 {
-    return cbor_put_type_val(b, 0, val);
+    c->buf = NULL;
+    c->cbuf = buf;
+    c->bufSz = len;
+    c->idx = 0;
 }
 
-static int cbor_put_neg(struct cbor_buf *b, int32_t neg_val)
+/* Text strings in CTAP2 replies are all string literals. */
+static int cbor_put_text(WOLFCOSE_CBOR_CTX *c, const char *s)
 {
-    /* neg_val is negative; CBOR stores -1 - value */
-    uint32_t val = (uint32_t)(-1 - neg_val);
-    return cbor_put_type_val(b, 1, val);
+    return wc_CBOR_EncodeTstr(c, (const uint8_t *)s, strlen(s));
 }
 
-static int cbor_put_int(struct cbor_buf *b, int32_t val)
+static int cbor_put_bool(WOLFCOSE_CBOR_CTX *c, bool v)
 {
-    if (val < 0) {
-        return cbor_put_neg(b, val);
-    }
-    return cbor_put_uint(b, (uint32_t)val);
+    return v ? wc_CBOR_EncodeTrue(c) : wc_CBOR_EncodeFalse(c);
 }
 
-static int cbor_put_bytes(struct cbor_buf *b, const uint8_t *data, uint16_t len)
+/* Read a byte string, rejecting anything that does not fit a uint16_t length.
+ * Every bstr this authenticator accepts is far below that bound.
+ */
+static int cbor_read_bytes(WOLFCOSE_CBOR_CTX *c, const uint8_t **out,
+                           uint32_t *out_len)
 {
-    if (cbor_put_type_val(b, 2, len) != 0)
+    const uint8_t *d;
+    size_t dlen;
+    if (wc_CBOR_DecodeBstr(c, &d, &dlen) != WOLFCOSE_SUCCESS)
         return -1;
-    if (b->len + len > b->cap)
+    if (dlen > UINT16_MAX)
         return -1;
-    memcpy(&b->buf[b->len], data, len);
-    b->len += len;
+    *out = d;
+    *out_len = (uint32_t)dlen;
     return 0;
 }
 
-static int cbor_put_text(struct cbor_buf *b, const char *s)
+static int cbor_read_text(WOLFCOSE_CBOR_CTX *c, const uint8_t **out,
+                          uint32_t *out_len)
 {
-    size_t len = strlen(s);
-    if (len > UINT16_MAX)
+    const uint8_t *d;
+    size_t dlen;
+    if (wc_CBOR_DecodeTstr(c, &d, &dlen) != WOLFCOSE_SUCCESS)
         return -1;
-    if (cbor_put_type_val(b, 3, (uint32_t)len) != 0)
+    if (dlen > UINT16_MAX)
         return -1;
-    if (b->len + len > b->cap)
-        return -1;
-    memcpy(&b->buf[b->len], s, len);
-    b->len += (uint16_t)len;
+    *out = d;
+    *out_len = (uint32_t)dlen;
     return 0;
 }
 
-static int cbor_put_bool(struct cbor_buf *b, bool v)
+/* Read a definite-length map header, bounding the entry count so a malformed
+ * request cannot spin the per-entry loops.
+ */
+static int cbor_read_map(WOLFCOSE_CBOR_CTX *c, uint32_t *items)
 {
-    return cbor_put_type_val(b, 7, v ? 21 : 20);
-}
-
-static int cbor_start_array(struct cbor_buf *b, uint8_t count)
-{
-    return cbor_put_type_val(b, 4, count);
-}
-
-static int cbor_start_map(struct cbor_buf *b, uint8_t count)
-{
-    return cbor_put_type_val(b, 5, count);
-}
-
-/* --- CBOR decoding helpers (minimal, definite lengths only) --- */
-static int cbor_read_hdr(const uint8_t *buf, uint16_t len, uint8_t *major, uint32_t *val, uint16_t *consumed)
-{
-    if (len == 0)
+    size_t count;
+    if (wc_CBOR_DecodeMapStart(c, &count) != WOLFCOSE_SUCCESS)
         return -1;
-    uint8_t ib = buf[0];
-    uint8_t addl = ib & 0x1f;
-    *major = ib >> 5;
-    *consumed = 1;
-    if (addl < 24) {
-        *val = addl;
-    } else if (addl == 24) {
-        if (len < 2) return -1;
-        *val = buf[1];
-        *consumed = 2;
-    } else if (addl == 25) {
-        if (len < 3) return -1;
-        *val = ((uint32_t)buf[1] << 8) | buf[2];
-        *consumed = 3;
-    } else if (addl == 26) {
-        if (len < 5) return -1;
-        *val = ((uint32_t)buf[1] << 24) | ((uint32_t)buf[2] << 16) | ((uint32_t)buf[3] << 8) | buf[4];
-        *consumed = 5;
-    } else {
-        return -1; /* Indefinite/too large not supported */
-    }
+    if (count > c->bufSz)
+        return -1;
+    *items = (uint32_t)count;
     return 0;
 }
 
-static int cbor_skip(const uint8_t *buf, uint16_t len, uint16_t *consumed)
+static int cbor_read_array(WOLFCOSE_CBOR_CTX *c, uint32_t *items)
 {
-    uint8_t major;
-    uint32_t val;
-    uint16_t hdr_len;
-    if (cbor_read_hdr(buf, len, &major, &val, &hdr_len) != 0)
+    size_t count;
+    if (wc_CBOR_DecodeArrayStart(c, &count) != WOLFCOSE_SUCCESS)
         return -1;
-    if (len < hdr_len)
+    if (count > c->bufSz)
         return -1;
-
-    const uint8_t *p = buf + hdr_len;
-    uint16_t remain = (uint16_t)(len - hdr_len);
-    switch (major) {
-        case 0: /* uint */
-        case 1: /* nint */
-        case 7: /* simple */
-            *consumed = hdr_len;
-            return 0;
-        case 2: /* bytes */
-        case 3: /* text */
-            if (remain < val)
-                return -1;
-            *consumed = (uint16_t)(hdr_len + val);
-            return 0;
-        case 4: { /* array */
-            uint16_t total = hdr_len;
-            for (uint32_t i = 0; i < val; i++) {
-                uint16_t inner = 0;
-                if (cbor_skip(p, remain, &inner) != 0)
-                    return -1;
-                total += inner;
-                if (remain < inner)
-                    return -1;
-                p += inner;
-                remain = (uint16_t)(remain - inner);
-            }
-            *consumed = total;
-            return 0;
-        }
-        case 5: { /* map */
-            uint16_t total = hdr_len;
-            for (uint32_t i = 0; i < val; i++) {
-                uint16_t inner = 0;
-                if (cbor_skip(p, remain, &inner) != 0)
-                    return -1;
-                total += inner;
-                if (remain < inner)
-                    return -1;
-                p += inner;
-                remain = (uint16_t)(remain - inner);
-                if (cbor_skip(p, remain, &inner) != 0)
-                    return -1;
-                total += inner;
-                if (remain < inner)
-                    return -1;
-                p += inner;
-                remain = (uint16_t)(remain - inner);
-            }
-            *consumed = total;
-            return 0;
-        }
-        default:
-            return -1;
-    }
-}
-
-static int cbor_read_bytes(const uint8_t *buf, uint16_t len, const uint8_t **out, uint32_t *out_len, uint16_t *consumed)
-{
-    uint8_t major;
-    uint32_t val;
-    uint16_t hdr_len;
-    if (cbor_read_hdr(buf, len, &major, &val, &hdr_len) != 0)
-        return -1;
-    if (major != 2)
-        return -1;
-    if (len < hdr_len + val)
-        return -1;
-    *out = buf + hdr_len;
-    *out_len = val;
-    *consumed = (uint16_t)(hdr_len + val);
+    *items = (uint32_t)count;
     return 0;
 }
 
-static int cbor_read_text(const uint8_t *buf, uint16_t len, const uint8_t **out, uint32_t *out_len, uint16_t *consumed)
+/* Skip one complete item and hand back the slice it occupied, so callers can
+ * re-parse it later (allowList entries, embedded COSE_Key maps).
+ */
+static int cbor_skip_slice(WOLFCOSE_CBOR_CTX *c, const uint8_t **slice,
+                           uint16_t *slice_len)
 {
-    uint8_t major;
-    uint32_t val;
-    uint16_t hdr_len;
-    if (cbor_read_hdr(buf, len, &major, &val, &hdr_len) != 0)
+    size_t start = c->idx;
+    if (wc_CBOR_Skip(c) != WOLFCOSE_SUCCESS)
         return -1;
-    if (major != 3)
+    if ((c->idx - start) > UINT16_MAX)
         return -1;
-    if (len < hdr_len + val)
-        return -1;
-    *out = buf + hdr_len;
-    *out_len = val;
-    *consumed = (uint16_t)(hdr_len + val);
+    if (slice)
+        *slice = c->cbuf + start;
+    if (slice_len)
+        *slice_len = (uint16_t)(c->idx - start);
     return 0;
 }
 
@@ -433,37 +325,6 @@ static int pin_generate_agreement_key(WC_RNG *rng)
         return -1;
     pin_agree_valid = true;
     pin_agree_consumed = false;
-    return 0;
-}
-
-static int hkdf32(const uint8_t *ikm, uint16_t ikm_len,
-                  const uint8_t *info, uint16_t info_len,
-                  uint8_t *out)
-{
-    uint8_t prk_val[HASH_SZ];
-    uint8_t t[HASH_SZ];
-    uint8_t salt[HASH_SZ] = {0};
-    Hmac prk, okm;
-    int r = wc_HmacInit(&prk, NULL, 0);
-    if (r != 0) return -1;
-    r = wc_HmacSetKey(&prk, SHA256, salt, sizeof(salt));
-    if (r != 0) { wc_HmacFree(&prk); return -1; }
-    wc_HmacUpdate(&prk, ikm, ikm_len);
-    wc_HmacFinal(&prk, prk_val);
-    wc_HmacFree(&prk);
-
-    r = wc_HmacInit(&okm, NULL, 0);
-    if (r != 0) { ForceZero(prk_val, sizeof(prk_val)); return -1; }
-    r = wc_HmacSetKey(&okm, SHA256, prk_val, sizeof(prk_val));
-    if (r != 0) { wc_HmacFree(&okm); ForceZero(prk_val, sizeof(prk_val)); return -1; }
-    wc_HmacUpdate(&okm, info, info_len);
-    uint8_t one = 0x01;
-    wc_HmacUpdate(&okm, &one, 1);
-    wc_HmacFinal(&okm, t);
-    wc_HmacFree(&okm);
-    memcpy(out, t, HASH_SZ);
-    ForceZero(prk_val, sizeof(prk_val));
-    ForceZero(t, sizeof(t));
     return 0;
 }
 
@@ -667,31 +528,43 @@ static int build_credential_id(WC_RNG *rng, const uint8_t *rpIdHash,
     return 0;
 }
 
-static int encode_cose_pubkey(struct cbor_buf *c, const uint8_t *qx, const uint8_t *qy)
+/* Serialise a P-256 public key as a COSE_Key map via wolfCOSE. The emitted
+ * map is {1: 2, 3: alg, -1: 1, -2: qx, -3: qy}, which is the CTAP2 canonical
+ * CBOR key order (all labels encode to one byte: 0x01 0x03 0x20 0x21 0x22).
+ * Takes the live ecc_key so no point re-import is needed on the hot paths.
+ */
+static int encode_cose_pubkey(WOLFCOSE_CBOR_CTX *c, ecc_key *ecc, int32_t alg)
 {
-    if (cbor_start_map(c, 5) != 0) return -1;
-    if (cbor_put_int(c, COSE_KEY_KTY_LABEL) != 0) return -1;
-    if (cbor_put_uint(c, COSE_KTY_EC2) != 0) return -1;
-    if (cbor_put_int(c, COSE_KEY_ALG_LABEL) != 0) return -1;
-    if (cbor_put_int(c, COSE_ALG_ES256) != 0) return -1;
-    if (cbor_put_int(c, COSE_KEY_CRV_LABEL) != 0) return -1;
-    if (cbor_put_uint(c, COSE_CRV_P256) != 0) return -1;
-    if (cbor_put_int(c, COSE_KEY_X_LABEL) != 0) return -1;
-    if (cbor_put_bytes(c, qx, ECC_SZ) != 0) return -1;
-    if (cbor_put_int(c, COSE_KEY_Y_LABEL) != 0) return -1;
-    if (cbor_put_bytes(c, qy, ECC_SZ) != 0) return -1;
+    WOLFCOSE_KEY key;
+    size_t written = 0;
+
+    if (wc_CoseKey_Init(&key) != WOLFCOSE_SUCCESS)
+        return -1;
+    if (wc_CoseKey_SetEcc(&key, WOLFCOSE_CRV_P256, ecc) != WOLFCOSE_SUCCESS)
+        return -1;
+    key.alg = alg;
+    /* Both callers pass a key that still holds its private scalar.
+     * wc_CoseKey_SetEcc() sets hasPrivate for those, and wc_CoseKey_Encode()
+     * would then serialise -4:d into a reply that goes out over USB. This
+     * serialiser is public-key-only by contract, so clear it explicitly.
+     */
+    key.hasPrivate = 0;
+    if (wc_CoseKey_Encode(&key, c->buf + c->idx, c->bufSz - c->idx,
+                          &written) != WOLFCOSE_SUCCESS)
+        return -1;
+    c->idx += written;
     return 0;
 }
 
 static int build_authdata_attested(const uint8_t *rpIdHash, uint8_t flags, uint32_t counter,
                                    const uint8_t *credId, uint16_t credIdLen,
-                                   const uint8_t *pubkey_qx, const uint8_t *pubkey_qy,
+                                   ecc_key *pubkey,
                                    uint8_t *authData, uint16_t authDataCap, uint16_t *authDataLen)
 {
     uint8_t aaguid[16] = {0};
     uint16_t idx = 0;
     uint8_t counter_be[4];
-    struct cbor_buf cose = {0};
+    WOLFCOSE_CBOR_CTX cose;
 
     counter_be[0] = (uint8_t)((counter >> 24) & 0xFF);
     counter_be[1] = (uint8_t)((counter >> 16) & 0xFF);
@@ -713,12 +586,10 @@ static int build_authdata_attested(const uint8_t *rpIdHash, uint8_t flags, uint3
     memcpy(&authData[idx], credId, credIdLen);
     idx += credIdLen;
 
-    cose.buf = &authData[idx];
-    cose.cap = (uint16_t)(authDataCap - idx);
-    cose.len = 0;
-    if (encode_cose_pubkey(&cose, pubkey_qx, pubkey_qy) != 0)
+    cbor_enc_init(&cose, &authData[idx], (uint16_t)(authDataCap - idx), 0);
+    if (encode_cose_pubkey(&cose, pubkey, COSE_ALG_ES256) != 0)
         return -1;
-    idx += cose.len;
+    idx += (uint16_t)cose.idx;
     *authDataLen = idx;
     return 0;
 }
@@ -753,86 +624,40 @@ static int build_authdata_assert(const uint8_t *rpIdHash, uint8_t flags, uint32_
     return 0;
 }
 
+/* Decode a platform-supplied COSE_Key (P-256) into raw qx/qy. wolfCOSE checks
+ * kty/crv against the attached key type and imports the point; the import
+ * itself rejects anything that is not on the curve.
+ */
 static int parse_cose_pubkey(const uint8_t *buf, uint16_t len, uint8_t *qx, uint8_t *qy)
 {
-    uint8_t major; uint32_t items; uint16_t cons;
-    const uint8_t *p = buf; uint16_t remain = len;
-    bool kty_ok = false, crv_ok = false, alg_ok = false, x_ok = false, y_ok = false;
-    if (cbor_read_hdr(p, remain, &major, &items, &cons) != 0 || major != 5)
+    WOLFCOSE_KEY key;
+    ecc_key ecc;
+    word32 qxlen = ECC_SZ, qylen = ECC_SZ;
+    int ret = -1;
+
+    if (wc_ecc_init(&ecc) != 0)
         return -1;
-    p += cons; remain -= cons;
-    for (uint32_t i = 0; i < items; i++) {
-        int32_t key = 0;
-        uint16_t kcons;
-        if (cbor_read_hdr(p, remain, &major, (uint32_t *)&key, &kcons) != 0)
-            return -1;
-        if (major == 1) { /* negative */
-            key = -1 - (int32_t)key;
-        }
-        p += kcons; remain -= kcons;
-        switch (key) {
-            case COSE_KEY_KTY_LABEL: {
-                uint8_t vmajor; uint32_t vval; uint16_t vcons;
-                if (cbor_read_hdr(p, remain, &vmajor, &vval, &vcons) != 0)
-                    return -1;
-                if (vmajor == 0 && vval == COSE_KTY_EC2)
-                    kty_ok = true;
-                p += vcons; remain -= vcons;
-                break;
-            }
-            case COSE_KEY_ALG_LABEL: {
-                uint8_t vmajor; uint32_t vval; uint16_t vcons;
-                if (cbor_read_hdr(p, remain, &vmajor, &vval, &vcons) != 0)
-                    return -1;
-                if (vmajor == 1) {
-                    int32_t a = -1 - (int32_t)vval;
-                    if (a == COSE_ALG_ECDH_ES_HKDF256 || a == COSE_ALG_ES256)
-                        alg_ok = true;
-                }
-                p += vcons; remain -= vcons;
-                break;
-            }
-            case COSE_KEY_CRV_LABEL: {
-                uint8_t vmajor; uint32_t vval; uint16_t vcons;
-                if (cbor_read_hdr(p, remain, &vmajor, &vval, &vcons) != 0)
-                    return -1;
-                if (vmajor == 0 && vval == COSE_CRV_P256)
-                    crv_ok = true;
-                p += vcons; remain -= vcons;
-                break;
-            }
-            case COSE_KEY_X_LABEL: {
-                const uint8_t *vx; uint32_t vlen; uint16_t vcons;
-                if (cbor_read_bytes(p, remain, &vx, &vlen, &vcons) != 0)
-                    return -1;
-                if (vlen == ECC_SZ) {
-                    memcpy(qx, vx, ECC_SZ);
-                    x_ok = true;
-                }
-                p += vcons; remain -= vcons;
-                break;
-            }
-            case COSE_KEY_Y_LABEL: {
-                const uint8_t *vy; uint32_t vlen; uint16_t vcons;
-                if (cbor_read_bytes(p, remain, &vy, &vlen, &vcons) != 0)
-                    return -1;
-                if (vlen == ECC_SZ) {
-                    memcpy(qy, vy, ECC_SZ);
-                    y_ok = true;
-                }
-                p += vcons; remain -= vcons;
-                break;
-            }
-            default: {
-                uint16_t skip;
-                if (cbor_skip(p, remain, &skip) != 0)
-                    return -1;
-                p += skip; remain -= skip;
-                break;
-            }
-        }
-    }
-    return (kty_ok && crv_ok && alg_ok && x_ok && y_ok) ? 0 : -1;
+    if (wc_CoseKey_Init(&key) != WOLFCOSE_SUCCESS)
+        goto out;
+    if (wc_CoseKey_SetEcc(&key, WOLFCOSE_CRV_P256, &ecc) != WOLFCOSE_SUCCESS)
+        goto out;
+    if (wc_CoseKey_Decode(&key, buf, len) != WOLFCOSE_SUCCESS)
+        goto out;
+    if (key.kty != WOLFCOSE_KTY_EC2 || key.crv != WOLFCOSE_CRV_P256)
+        goto out;
+    /* alg is optional in a CTAP2 keyAgreement key; reject only a wrong one. */
+    if (key.alg != 0 && key.alg != COSE_ALG_ECDH_ES_HKDF256 &&
+        key.alg != COSE_ALG_ES256)
+        goto out;
+    if (wc_ecc_export_public_raw(&ecc, qx, &qxlen, qy, &qylen) != 0)
+        goto out;
+    if (qxlen != ECC_SZ || qylen != ECC_SZ)
+        goto out;
+    ret = 0;
+
+out:
+    wc_ecc_free(&ecc);
+    return ret;
 }
 
 struct mc_params {
@@ -877,119 +702,117 @@ struct ga_params {
     int hs_pin_protocol;
 };
 
+/* Read a map key that may be encoded either as an unsigned int (CTAP2
+ * canonical) or as a text label, which some clients still emit inside
+ * pubKeyCredParams and allowList entries.
+ */
+struct cbor_key {
+    bool is_text;
+    uint64_t num;
+    const uint8_t *text;
+    uint32_t text_len;
+};
+
+static int cbor_read_key(WOLFCOSE_CBOR_CTX *c, struct cbor_key *k)
+{
+    memset(k, 0, sizeof(*k));
+    switch (wc_CBOR_PeekType(c)) {
+        case WOLFCOSE_CBOR_UINT:
+            if (wc_CBOR_DecodeUint(c, &k->num) != WOLFCOSE_SUCCESS)
+                return -1;
+            return 0;
+        case WOLFCOSE_CBOR_TSTR:
+            k->is_text = true;
+            return cbor_read_text(c, &k->text, &k->text_len);
+        default:
+            return -1;
+    }
+}
+
+static bool cbor_key_is(const struct cbor_key *k, uint64_t num, const char *lit)
+{
+    if (!k->is_text)
+        return k->num == num;
+    return k->text_len == strlen(lit) &&
+           memcmp(k->text, lit, k->text_len) == 0;
+}
+
+/* Read a CBOR true/false into *out, leaving *out untouched for other types. */
+static int cbor_read_bool(WOLFCOSE_CBOR_CTX *c, bool *out)
+{
+    WOLFCOSE_CBOR_ITEM item;
+    if (wc_CBOR_DecodeHead(c, &item) != WOLFCOSE_SUCCESS)
+        return -1;
+    if (item.majorType == WOLFCOSE_CBOR_SIMPLE && item.val == 21)
+        *out = true;
+    return 0;
+}
+
 static int parse_makecred(const uint8_t *buf, uint16_t len, struct mc_params *out)
 {
-    uint8_t major;
+    WOLFCOSE_CBOR_CTX c;
     uint32_t items;
-    uint16_t cons;
-    const uint8_t *p = buf;
-    uint16_t remain = len;
 
     memset(out, 0, sizeof(*out));
-    if (cbor_read_hdr(p, remain, &major, &items, &cons) != 0 || major != 5)
+    cbor_dec_init(&c, buf, len);
+    if (cbor_read_map(&c, &items) != 0)
         return -1;
-    p += cons; remain -= cons;
 
     for (uint32_t i = 0; i < items; i++) {
-        uint32_t key;
-        uint16_t kcons;
-        if (cbor_read_hdr(p, remain, &major, &key, &kcons) != 0 || major != 0)
+        uint64_t key;
+        if (wc_CBOR_DecodeUint(&c, &key) != WOLFCOSE_SUCCESS)
             return -1;
-        p += kcons; remain -= kcons;
 
         switch (key) {
-            case 1: { /* clientDataHash */
-                const uint8_t *cdh; uint32_t cdh_len; uint16_t vcons;
-                if (cbor_read_bytes(p, remain, &cdh, &cdh_len, &vcons) != 0)
+            case 1: /* clientDataHash */
+                if (cbor_read_bytes(&c, &out->clientDataHash, &out->cdh_len) != 0)
                     return -1;
-                out->clientDataHash = cdh;
-                out->cdh_len = cdh_len;
-                p += vcons; remain -= vcons;
                 break;
-            }
             case 2: { /* rp */
-                uint8_t mmajor; uint32_t mitems; uint16_t vcons;
-                if (cbor_read_hdr(p, remain, &mmajor, &mitems, &vcons) != 0 || mmajor != 5)
+                uint32_t mitems;
+                if (cbor_read_map(&c, &mitems) != 0)
                     return -1;
-                p += vcons; remain -= vcons;
                 for (uint32_t j = 0; j < mitems; j++) {
-                    const uint8_t *t; uint32_t tlen; uint16_t tcons;
-                    if (cbor_read_text(p, remain, &t, &tlen, &tcons) != 0)
+                    const uint8_t *t; uint32_t tlen;
+                    if (cbor_read_text(&c, &t, &tlen) != 0)
                         return -1;
-                    p += tcons; remain -= tcons;
-                    /* value */
                     if (tlen == 2 && t[0] == 'i' && t[1] == 'd') {
-                        const uint8_t *rpv; uint32_t rplen; uint16_t rvcons;
-                        if (cbor_read_text(p, remain, &rpv, &rplen, &rvcons) != 0)
+                        if (cbor_read_text(&c, &out->rp_id, &out->rp_id_len) != 0)
                             return -1;
-                        out->rp_id = rpv;
-                        out->rp_id_len = rplen;
-                        p += rvcons; remain -= rvcons;
-                    } else {
-                        uint16_t skip;
-                        if (cbor_skip(p, remain, &skip) != 0)
-                            return -1;
-                        p += skip; remain -= skip;
+                    } else if (wc_CBOR_Skip(&c) != WOLFCOSE_SUCCESS) {
+                        return -1;
                     }
                 }
                 break;
             }
             case 4: { /* pubKeyCredParams */
-                uint8_t amajor; uint32_t acount; uint16_t vcons;
-                if (cbor_read_hdr(p, remain, &amajor, &acount, &vcons) != 0 || amajor != 4)
+                uint32_t acount;
+                if (cbor_read_array(&c, &acount) != 0)
                     return -1;
-                p += vcons; remain -= vcons;
                 for (uint32_t j = 0; j < acount; j++) {
-                    uint8_t mmajor; uint32_t mitems; uint16_t mcons;
-                    if (cbor_read_hdr(p, remain, &mmajor, &mitems, &mcons) != 0 || mmajor != 5)
-                        return -1;
-                    p += mcons; remain -= mcons;
+                    uint32_t mitems;
                     bool type_ok = false;
                     bool alg_ok = false;
+                    if (cbor_read_map(&c, &mitems) != 0)
+                        return -1;
                     for (uint32_t k = 0; k < mitems; k++) {
-                        uint32_t mkey; uint16_t kkcons; uint16_t key_used = 0;
-                        uint8_t key_major;
-                        const uint8_t *tkey = NULL; uint32_t tlen = 0; uint16_t tcons = 0;
-                        if (cbor_read_hdr(p, remain, &key_major, &mkey, &kkcons) != 0)
+                        struct cbor_key mkey;
+                        if (cbor_read_key(&c, &mkey) != 0)
                             return -1;
-                        if (key_major == 3) { /* text label (e.g., "type"/"alg") */
-                            if (cbor_read_text(p, remain, &tkey, &tlen, &tcons) != 0)
+                        if (cbor_key_is(&mkey, 1, "type")) {
+                            const uint8_t *tv; uint32_t tvlen;
+                            if (cbor_read_text(&c, &tv, &tvlen) != 0)
                                 return -1;
-                            key_used = tcons;
-                        } else if (key_major == 0) {
-                            key_used = kkcons;
-                        } else {
-                            return -1;
-                        }
-                        if (remain < key_used)
-                            return -1;
-                        p += key_used; remain -= key_used;
-                        bool key_is_type = (key_major == 0 && mkey == 1) ||
-                                           (key_major == 3 && tlen == 4 && memcmp(tkey, "type", 4) == 0);
-                        bool key_is_alg = (key_major == 0 && mkey == 3) ||
-                                          (key_major == 3 && tlen == 3 && memcmp(tkey, "alg", 3) == 0);
-                        if (key_is_type) { /* type */
-                            const uint8_t *tv; uint32_t tlen; uint16_t tvcons;
-                            if (cbor_read_text(p, remain, &tv, &tlen, &tvcons) != 0)
-                                return -1;
-                            if (tlen == 10 && memcmp(tv, "public-key", 10) == 0)
+                            if (tvlen == 10 && memcmp(tv, "public-key", 10) == 0)
                                 type_ok = true;
-                            p += tvcons; remain -= tvcons;
-                        } else if (key_is_alg) { /* alg */
-                            uint8_t alg_major; uint32_t alg_val; uint16_t alg_cons;
-                            if (cbor_read_hdr(p, remain, &alg_major, &alg_val, &alg_cons) != 0)
+                        } else if (cbor_key_is(&mkey, 3, "alg")) {
+                            int64_t aval;
+                            if (wc_CBOR_DecodeInt(&c, &aval) != WOLFCOSE_SUCCESS)
                                 return -1;
-                            if (alg_major == 1) { /* negative */
-                                int32_t aval = -1 - (int32_t)alg_val;
-                                if (aval == COSE_ALG_ES256)
-                                    alg_ok = true;
-                            }
-                            p += alg_cons; remain -= alg_cons;
-                        } else {
-                            uint16_t skip;
-                            if (cbor_skip(p, remain, &skip) != 0)
-                                return -1;
-                            p += skip; remain -= skip;
+                            if (aval == COSE_ALG_ES256)
+                                alg_ok = true;
+                        } else if (wc_CBOR_Skip(&c) != WOLFCOSE_SUCCESS) {
+                            return -1;
                         }
                     }
                     if (type_ok && alg_ok)
@@ -998,54 +821,40 @@ static int parse_makecred(const uint8_t *buf, uint16_t len, struct mc_params *ou
                 break;
             }
             case 7: { /* options */
-                uint8_t mmajor; uint32_t mitems; uint16_t vcons;
-                if (cbor_read_hdr(p, remain, &mmajor, &mitems, &vcons) != 0 || mmajor != 5)
+                uint32_t mitems;
+                if (cbor_read_map(&c, &mitems) != 0)
                     return -1;
-                p += vcons; remain -= vcons;
                 for (uint32_t j = 0; j < mitems; j++) {
-                    const uint8_t *tn; uint32_t tnlen; uint16_t tncons;
-                    if (cbor_read_text(p, remain, &tn, &tnlen, &tncons) != 0)
-                        return -1;
-                    p += tncons; remain -= tncons;
-                    uint8_t vmajor; uint32_t vval; uint16_t vcons2;
-                    if (cbor_read_hdr(p, remain, &vmajor, &vval, &vcons2) != 0)
+                    const uint8_t *tn; uint32_t tnlen;
+                    if (cbor_read_text(&c, &tn, &tnlen) != 0)
                         return -1;
                     if (tnlen == 2 && tn[0] == 'u' && tn[1] == 'v') {
-                        if (vmajor == 7 && vval == 21)
-                            out->uv_required = true;
+                        if (cbor_read_bool(&c, &out->uv_required) != 0)
+                            return -1;
                     } else if (tnlen == 2 && tn[0] == 'r' && tn[1] == 'k') {
-                        if (vmajor == 7 && vval == 21)
-                            out->rk = true;
+                        if (cbor_read_bool(&c, &out->rk) != 0)
+                            return -1;
+                    } else if (wc_CBOR_Skip(&c) != WOLFCOSE_SUCCESS) {
+                        return -1;
                     }
-                    p += vcons2; remain -= vcons2;
                 }
                 break;
             }
-            case 8: { /* pinAuth */
-                const uint8_t *pa; uint32_t palen; uint16_t vcons;
-                if (cbor_read_bytes(p, remain, &pa, &palen, &vcons) != 0)
+            case 8: /* pinAuth */
+                if (cbor_read_bytes(&c, &out->pin_auth, &out->pin_auth_len) != 0)
                     return -1;
-                out->pin_auth = pa;
-                out->pin_auth_len = palen;
-                p += vcons; remain -= vcons;
                 break;
-            }
             case 9: { /* pinProtocol */
-                uint8_t vmajor; uint32_t vval; uint16_t vcons;
-                if (cbor_read_hdr(p, remain, &vmajor, &vval, &vcons) != 0)
+                uint64_t v;
+                if (wc_CBOR_DecodeUint(&c, &v) != WOLFCOSE_SUCCESS)
                     return -1;
-                if (vmajor == 0)
-                    out->pin_protocol = (int)vval;
-                p += vcons; remain -= vcons;
+                out->pin_protocol = (int)v;
                 break;
             }
-            default: {
-                uint16_t skip;
-                if (cbor_skip(p, remain, &skip) != 0)
+            default:
+                if (wc_CBOR_Skip(&c) != WOLFCOSE_SUCCESS)
                     return -1;
-                p += skip; remain -= skip;
                 break;
-            }
         }
     }
 
@@ -1058,120 +867,65 @@ static int parse_makecred(const uint8_t *buf, uint16_t len, struct mc_params *ou
     return 0;
 }
 
-static bool key_eq(const uint8_t *s, uint32_t len, const char *lit)
-{
-    size_t l = strlen(lit);
-    return len == l && memcmp(s, lit, l) == 0;
-}
-
 static int parse_hmac_secret_input(const uint8_t *buf, uint16_t len, struct ga_params *out)
 {
-    uint8_t major; uint32_t items; uint16_t cons;
-    const uint8_t *p = buf; uint16_t remain = len;
+    WOLFCOSE_CBOR_CTX c;
+    uint32_t items;
 
-    if (cbor_read_hdr(p, remain, &major, &items, &cons) != 0)
+    cbor_dec_init(&c, buf, len);
+    if (cbor_read_map(&c, &items) != 0)
         return -1;
-    if (major != 5)
-        return -1;
-    p += cons; remain -= cons;
+
     for (uint32_t i = 0; i < items; i++) {
-        uint8_t kmajor; uint32_t kval; uint16_t kcons;
-        const uint8_t *ktext = NULL; uint32_t klen = 0; uint16_t ktext_cons = 0;
-        if (cbor_read_hdr(p, remain, &kmajor, &kval, &kcons) != 0)
-            return -1;
-        if (kmajor == 3) {
-            if (cbor_read_text(p, remain, &ktext, &klen, &ktext_cons) != 0)
-                return -1;
-            if (remain < ktext_cons)
-                return -1;
-            p += ktext_cons; remain -= ktext_cons;
-        } else {
-            if (remain < kcons)
-                return -1;
-            p += kcons; remain -= kcons;
-        }
+        struct cbor_key key;
+        uint32_t iitems;
 
-        bool key_is_hs = (kmajor == 3 && key_eq(ktext, klen, "hmac-secret"));
-        if (!key_is_hs) {
-            uint16_t skip;
-            if (cbor_skip(p, remain, &skip) != 0)
+        if (cbor_read_key(&c, &key) != 0)
+            return -1;
+        /* The extension is always identified by its text name. */
+        if (!key.is_text || !cbor_key_is(&key, 0, "hmac-secret")) {
+            if (wc_CBOR_Skip(&c) != WOLFCOSE_SUCCESS)
                 return -1;
-            p += skip; remain = (uint16_t)(remain - skip);
             continue;
         }
 
         /* Parse inner hmac-secret map */
-        uint8_t imajor; uint32_t iitems; uint16_t icons;
-        if (cbor_read_hdr(p, remain, &imajor, &iitems, &icons) != 0 || imajor != 5)
+        if (cbor_read_map(&c, &iitems) != 0)
             return -1;
-        p += icons; remain -= icons;
         for (uint32_t j = 0; j < iitems; j++) {
-            uint8_t ikmajor; uint32_t ikval; uint16_t ikcons;
-            const uint8_t *iktext = NULL; uint32_t iklen = 0; uint16_t iktext_cons = 0;
-            if (cbor_read_hdr(p, remain, &ikmajor, &ikval, &ikcons) != 0)
+            struct cbor_key ikey;
+            if (cbor_read_key(&c, &ikey) != 0)
                 return -1;
-            if (ikmajor == 3) {
-                if (cbor_read_text(p, remain, &iktext, &iklen, &iktext_cons) != 0)
-                    return -1;
-                if (remain < iktext_cons)
-                    return -1;
-                p += iktext_cons; remain -= iktext_cons;
-            } else {
-                if (remain < ikcons)
-                    return -1;
-                p += ikcons; remain -= ikcons;
-            }
 
-            bool key_is_agree = (ikmajor == 0 && ikval == 1) || (ikmajor == 3 && key_eq(iktext, iklen, "keyAgreement"));
-            bool key_is_salt_enc = (ikmajor == 0 && ikval == 2) || (ikmajor == 3 && key_eq(iktext, iklen, "saltEnc"));
-            bool key_is_salt_auth = (ikmajor == 0 && ikval == 3) || (ikmajor == 3 && key_eq(iktext, iklen, "saltAuth"));
-            bool key_is_pin_protocol = (ikmajor == 0 && ikval == 4) || (ikmajor == 3 && key_eq(iktext, iklen, "pinProtocol"));
-
-            if (key_is_agree) {
-                uint16_t skip;
-                if (cbor_skip(p, remain, &skip) != 0)
+            if (cbor_key_is(&ikey, 1, "keyAgreement")) {
+                const uint8_t *slice; uint16_t slice_len;
+                if (cbor_skip_slice(&c, &slice, &slice_len) != 0)
                     return -1;
-                if (skip > remain)
-                    return -1;
-                if (parse_cose_pubkey(p, skip, out->hs_platform_qx, out->hs_platform_qy) != 0)
+                if (parse_cose_pubkey(slice, slice_len, out->hs_platform_qx,
+                                      out->hs_platform_qy) != 0)
                     return -1;
                 out->hmac_secret_requested = true;
                 out->hs_key_set = true;
-                p += skip; remain = (uint16_t)(remain - skip);
-            } else if (key_is_salt_enc) {
-                const uint8_t *b; uint32_t blen; uint16_t bcons;
-                if (cbor_read_bytes(p, remain, &b, &blen, &bcons) != 0)
+            } else if (cbor_key_is(&ikey, 2, "saltEnc")) {
+                if (cbor_read_bytes(&c, &out->hs_salt_enc, &out->hs_salt_enc_len) != 0)
                     return -1;
-                if (blen != 32 && blen != 64)
+                if (out->hs_salt_enc_len != 32 && out->hs_salt_enc_len != 64)
                     return -1;
-                out->hs_salt_enc = b;
-                out->hs_salt_enc_len = blen;
                 out->hmac_secret_requested = true;
-                p += bcons; remain -= bcons;
-            } else if (key_is_salt_auth) {
-                const uint8_t *b; uint32_t blen; uint16_t bcons;
-                if (cbor_read_bytes(p, remain, &b, &blen, &bcons) != 0)
+            } else if (cbor_key_is(&ikey, 3, "saltAuth")) {
+                if (cbor_read_bytes(&c, &out->hs_salt_auth, &out->hs_salt_auth_len) != 0)
                     return -1;
-                if (blen != 16)
+                if (out->hs_salt_auth_len != 16)
                     return -1;
-                out->hs_salt_auth = b;
-                out->hs_salt_auth_len = blen;
                 out->hmac_secret_requested = true;
-                p += bcons; remain -= bcons;
-            } else if (key_is_pin_protocol) {
-                uint8_t vmajor; uint32_t vval; uint16_t vcons;
-                if (cbor_read_hdr(p, remain, &vmajor, &vval, &vcons) != 0)
+            } else if (cbor_key_is(&ikey, 4, "pinProtocol")) {
+                uint64_t v;
+                if (wc_CBOR_DecodeUint(&c, &v) != WOLFCOSE_SUCCESS)
                     return -1;
-                if (vmajor != 0)
-                    return -1;
-                out->hs_pin_protocol = (int)vval;
+                out->hs_pin_protocol = (int)v;
                 out->hmac_secret_requested = true;
-                p += vcons; remain -= vcons;
-            } else {
-                uint16_t skip;
-                if (cbor_skip(p, remain, &skip) != 0)
-                    return -1;
-                p += skip; remain = (uint16_t)(remain - skip);
+            } else if (wc_CBOR_Skip(&c) != WOLFCOSE_SUCCESS) {
+                return -1;
             }
         }
     }
@@ -1186,42 +940,33 @@ static int parse_hmac_secret_input(const uint8_t *buf, uint16_t len, struct ga_p
 
 static int parse_getassert(const uint8_t *buf, uint16_t len, struct ga_params *out)
 {
-    uint8_t major; uint32_t items; uint16_t cons;
-    const uint8_t *p = buf; uint16_t remain = len;
+    WOLFCOSE_CBOR_CTX c;
+    uint32_t items;
     memset(out, 0, sizeof(*out));
 
-    if (cbor_read_hdr(p, remain, &major, &items, &cons) != 0 || major != 5)
+    cbor_dec_init(&c, buf, len);
+    if (cbor_read_map(&c, &items) != 0)
         return -1;
-    p += cons; remain -= cons;
 
     for (uint32_t i = 0; i < items; i++) {
-        uint32_t key; uint16_t kcons;
-        if (cbor_read_hdr(p, remain, &major, &key, &kcons) != 0 || major != 0)
+        uint64_t key;
+        if (wc_CBOR_DecodeUint(&c, &key) != WOLFCOSE_SUCCESS)
             return -1;
-        p += kcons; remain -= kcons;
 
         switch (key) {
-            case 1: { /* rpId */
-                const uint8_t *rp; uint32_t rplen; uint16_t vcons;
-                if (cbor_read_text(p, remain, &rp, &rplen, &vcons) != 0)
+            case 1: /* rpId */
+                if (cbor_read_text(&c, &out->rp_id, &out->rp_id_len) != 0)
                     return -1;
-                out->rp_id = rp; out->rp_id_len = rplen;
-                p += vcons; remain -= vcons;
                 break;
-            }
-            case 2: { /* clientDataHash */
-                const uint8_t *cdh; uint32_t cdh_len; uint16_t vcons;
-                if (cbor_read_bytes(p, remain, &cdh, &cdh_len, &vcons) != 0)
+            case 2: /* clientDataHash */
+                if (cbor_read_bytes(&c, &out->clientDataHash, &out->cdh_len) != 0)
                     return -1;
-                out->clientDataHash = cdh; out->cdh_len = cdh_len;
-                p += vcons; remain -= vcons;
                 break;
-            }
             case 3: { /* allowList */
-                uint8_t amajor; uint32_t acount; uint16_t vcons;
-                if (cbor_read_hdr(p, remain, &amajor, &acount, &vcons) != 0 || amajor != 4)
+                uint32_t acount;
+                size_t start;
+                if (cbor_read_array(&c, &acount) != 0)
                     return -1;
-                p += vcons; remain -= vcons;
                 if (acount == 0) {
                     out->allow_rk = true;
                     out->allow_list = NULL;
@@ -1229,85 +974,57 @@ static int parse_getassert(const uint8_t *buf, uint16_t len, struct ga_params *o
                     out->allow_count = 0;
                     break;
                 }
-                /* Record raw allowList for later scanning */
-                out->allow_list = p;
+                /* Record the raw array body for the later credential scan. */
+                start = c.idx;
+                out->allow_list = c.cbuf + start;
                 out->allow_count = acount;
-                /* Compute total length of the array content */
-                uint32_t allow_len = 0;
-                uint16_t skip_len = 0;
-                uint16_t tmp_remain = remain;
-                const uint8_t *tmp_p = p;
-                for (uint32_t i = 0; i < acount; i++) {
-                    if (cbor_skip(tmp_p, tmp_remain, &skip_len) != 0)
+                for (uint32_t j = 0; j < acount; j++) {
+                    if (wc_CBOR_Skip(&c) != WOLFCOSE_SUCCESS)
                         return -1;
-                    allow_len += skip_len;
-                    if (tmp_remain < skip_len)
-                        return -1;
-                    tmp_p += skip_len;
-                    tmp_remain = (uint16_t)(tmp_remain - skip_len);
                 }
-                out->allow_list_len = allow_len;
-                /* Advance main cursor past the array */
-                if (remain < allow_len)
-                    return -1;
-                p += allow_len;
-                remain = (uint16_t)(remain - allow_len);
+                out->allow_list_len = (uint32_t)(c.idx - start);
                 break;
             }
             case 4: { /* extensions */
-                uint16_t skip;
-                if (cbor_skip(p, remain, &skip) != 0)
+                const uint8_t *slice; uint16_t slice_len;
+                if (cbor_skip_slice(&c, &slice, &slice_len) != 0)
                     return -1;
-                if (parse_hmac_secret_input(p, skip, out) != 0)
+                if (parse_hmac_secret_input(slice, slice_len, out) != 0)
                     return -1;
-                p += skip; remain = (uint16_t)(remain - skip);
                 break;
             }
             case 5: { /* options */
-                uint8_t mmajor; uint32_t mitems; uint16_t vcons;
-                if (cbor_read_hdr(p, remain, &mmajor, &mitems, &vcons) != 0 || mmajor != 5)
+                uint32_t mitems;
+                if (cbor_read_map(&c, &mitems) != 0)
                     return -1;
-                p += vcons; remain -= vcons;
                 for (uint32_t j = 0; j < mitems; j++) {
-                    const uint8_t *tn; uint32_t tnlen; uint16_t tncons;
-                    if (cbor_read_text(p, remain, &tn, &tnlen, &tncons) != 0)
-                        return -1;
-                    p += tncons; remain -= tncons;
-                    uint8_t vmajor; uint32_t vval; uint16_t vcons2;
-                    if (cbor_read_hdr(p, remain, &vmajor, &vval, &vcons2) != 0)
+                    const uint8_t *tn; uint32_t tnlen;
+                    if (cbor_read_text(&c, &tn, &tnlen) != 0)
                         return -1;
                     if (tnlen == 2 && tn[0] == 'u' && tn[1] == 'v') {
-                        if (vmajor == 7 && vval == 21)
-                            out->uv_required = true;
+                        if (cbor_read_bool(&c, &out->uv_required) != 0)
+                            return -1;
+                    } else if (wc_CBOR_Skip(&c) != WOLFCOSE_SUCCESS) {
+                        return -1;
                     }
-                    p += vcons2; remain -= vcons2;
                 }
                 break;
             }
-            case 6: { /* pinAuth */
-                const uint8_t *pa; uint32_t palen; uint16_t vcons;
-                if (cbor_read_bytes(p, remain, &pa, &palen, &vcons) != 0)
+            case 6: /* pinAuth */
+                if (cbor_read_bytes(&c, &out->pin_auth, &out->pin_auth_len) != 0)
                     return -1;
-                out->pin_auth = pa; out->pin_auth_len = palen;
-                p += vcons; remain -= vcons;
                 break;
-            }
             case 7: { /* pinProtocol */
-                uint8_t vmajor; uint32_t vval; uint16_t vcons;
-                if (cbor_read_hdr(p, remain, &vmajor, &vval, &vcons) != 0)
+                uint64_t v;
+                if (wc_CBOR_DecodeUint(&c, &v) != WOLFCOSE_SUCCESS)
                     return -1;
-                if (vmajor == 0)
-                    out->pin_protocol = (int)vval;
-                p += vcons; remain -= vcons;
+                out->pin_protocol = (int)v;
                 break;
             }
-            default: {
-                uint16_t skip;
-                if (cbor_skip(p, remain, &skip) != 0)
+            default:
+                if (wc_CBOR_Skip(&c) != WOLFCOSE_SUCCESS)
                     return -1;
-                p += skip; remain -= skip;
                 break;
-            }
         }
     }
 
@@ -1334,43 +1051,38 @@ static const uint8_t fidelio_aaguid[16] = {
 static int ctap2_write_getinfo(uint8_t *reply, uint16_t reply_max, uint16_t *reply_len)
 {
     /* reply[0] = status, rest = CBOR */
-    struct cbor_buf c = {
-        .buf = reply,
-        .cap = reply_max,
-        .len = 0
-    };
+    WOLFCOSE_CBOR_CTX c;
 
     if (reply_max < 1)
         return -1;
 
     /* Reserve status byte at [0]; CBOR starts at [1]. */
-    c.len = 1;
+    cbor_enc_init(&c, reply, reply_max, 1);
     reply[0] = CTAP2_ERR_SUCCESS;
 
     /* Map entries: versions, extensions, aaguid, options, maxMsgSize, pinProtocols,
      * maxCredentialCountInList, maxCredentialIdLength
      */
-    const uint8_t map_items = 8;
-    if (cbor_start_map(&c, map_items) != 0) return -1;
+    if (wc_CBOR_EncodeMapStart(&c, 8) != 0) return -1;
 
     /* 1: versions */
-    if (cbor_put_uint(&c, 1) != 0) return -1;
-    if (cbor_start_array(&c, 1) != 0) return -1;
+    if (wc_CBOR_EncodeUint(&c, 1) != 0) return -1;
+    if (wc_CBOR_EncodeArrayStart(&c, 1) != 0) return -1;
     if (cbor_put_text(&c, "FIDO_2_0") != 0) return -1;
     //if (cbor_put_text(&c, "U2F_V2") != 0) return -1;
 
     /* 2: extensions */
-    if (cbor_put_uint(&c, 2) != 0) return -1;
-    if (cbor_start_array(&c, 1) != 0) return -1;
+    if (wc_CBOR_EncodeUint(&c, 2) != 0) return -1;
+    if (wc_CBOR_EncodeArrayStart(&c, 1) != 0) return -1;
     if (cbor_put_text(&c, "hmac-secret") != 0) return -1;
 
     /* 3: aaguid */
-    if (cbor_put_uint(&c, 3) != 0) return -1;
-    if (cbor_put_bytes(&c, fidelio_aaguid, sizeof(fidelio_aaguid)) != 0) return -1;
+    if (wc_CBOR_EncodeUint(&c, 3) != 0) return -1;
+    if (wc_CBOR_EncodeBstr(&c, fidelio_aaguid, sizeof(fidelio_aaguid)) != 0) return -1;
 
     /* 4: options map */
-    if (cbor_put_uint(&c, 4) != 0) return -1;
-    if (cbor_start_map(&c, 4) != 0) return -1;
+    if (wc_CBOR_EncodeUint(&c, 4) != 0) return -1;
+    if (wc_CBOR_EncodeMapStart(&c, 4) != 0) return -1;
     if (cbor_put_text(&c, "rk") != 0) return -1;
     if (cbor_put_bool(&c, false) != 0) return -1;
     if (cbor_put_text(&c, "up") != 0) return -1;
@@ -1381,25 +1093,25 @@ static int ctap2_write_getinfo(uint8_t *reply, uint16_t reply_max, uint16_t *rep
     if (cbor_put_bool(&c, true) != 0) return -1;
 
     /* 5: maxMsgSize */
-    if (cbor_put_uint(&c, 5) != 0) return -1;
-    if (cbor_put_uint(&c, 1024) != 0) return -1;
+    if (wc_CBOR_EncodeUint(&c, 5) != 0) return -1;
+    if (wc_CBOR_EncodeUint(&c, 1024) != 0) return -1;
 
     /* 6: pinProtocols */
-    if (cbor_put_uint(&c, 6) != 0) return -1;
-    if (cbor_start_array(&c, 1) != 0) return -1;
-    if (cbor_put_uint(&c, CTAP2_PIN_PROTOCOL_SUPPORTED) != 0) return -1;
+    if (wc_CBOR_EncodeUint(&c, 6) != 0) return -1;
+    if (wc_CBOR_EncodeArrayStart(&c, 1) != 0) return -1;
+    if (wc_CBOR_EncodeUint(&c, CTAP2_PIN_PROTOCOL_SUPPORTED) != 0) return -1;
 
     /* 7: maxCredentialCountInList */
-    if (cbor_put_uint(&c, 7) != 0) return -1;
-    if (cbor_put_uint(&c, 8) != 0) return -1;
+    if (wc_CBOR_EncodeUint(&c, 7) != 0) return -1;
+    if (wc_CBOR_EncodeUint(&c, 8) != 0) return -1;
 
     /* 8: maxCredentialIdLength */
-    if (cbor_put_uint(&c, 8) != 0) return -1;
-    if (cbor_put_uint(&c, 128) != 0) return -1;
+    if (wc_CBOR_EncodeUint(&c, 8) != 0) return -1;
+    if (wc_CBOR_EncodeUint(&c, 128) != 0) return -1;
 
     /* (algorithms omitted for now; add back when stable) */
 
-    *reply_len = c.len;
+    *reply_len = (uint16_t)c.idx;
     return 0;
 }
 
@@ -1518,7 +1230,7 @@ static int ctap2_make_credential(const uint8_t *payload, uint16_t payload_len,
     if (pin_store.magic == FLASH_PIN_MAGIC && params.pin_auth && params.pin_auth_len == 16)
         flags |= 0x04;
 
-    if (build_authdata_attested(rpIdHash, flags, device_get_counter(), credId, credIdLen, qx, qy,
+    if (build_authdata_attested(rpIdHash, flags, device_get_counter(), credId, credIdLen, &user_ecc,
                                 authData, sizeof(authData), &authDataLen) != 0) {
         ret = -1; goto cleanup;
     }
@@ -1537,24 +1249,25 @@ static int ctap2_make_credential(const uint8_t *payload, uint16_t payload_len,
     device_counter_inc();
 
     /* Build response */
-    struct cbor_buf c = {.buf = reply, .cap = reply_max, .len = 1};
+    WOLFCOSE_CBOR_CTX c;
+    cbor_enc_init(&c, reply, reply_max, 1);
     reply[0] = CTAP2_ERR_SUCCESS;
-    if (cbor_start_map(&c, 3) != 0) { ret = -1; goto cleanup; }
-    if (cbor_put_uint(&c, 1) != 0) { ret = -1; goto cleanup; }
+    if (wc_CBOR_EncodeMapStart(&c, 3) != 0) { ret = -1; goto cleanup; }
+    if (wc_CBOR_EncodeUint(&c, 1) != 0) { ret = -1; goto cleanup; }
     if (cbor_put_text(&c, "packed") != 0) { ret = -1; goto cleanup; }
-    if (cbor_put_uint(&c, 2) != 0) { ret = -1; goto cleanup; }
-    if (cbor_put_bytes(&c, authData, authDataLen) != 0) { ret = -1; goto cleanup; }
-    if (cbor_put_uint(&c, 3) != 0) { ret = -1; goto cleanup; }
-    if (cbor_start_map(&c, 3) != 0) { ret = -1; goto cleanup; }
+    if (wc_CBOR_EncodeUint(&c, 2) != 0) { ret = -1; goto cleanup; }
+    if (wc_CBOR_EncodeBstr(&c, authData, authDataLen) != 0) { ret = -1; goto cleanup; }
+    if (wc_CBOR_EncodeUint(&c, 3) != 0) { ret = -1; goto cleanup; }
+    if (wc_CBOR_EncodeMapStart(&c, 3) != 0) { ret = -1; goto cleanup; }
     if (cbor_put_text(&c, "alg") != 0) { ret = -1; goto cleanup; }
-    if (cbor_put_int(&c, COSE_ALG_ES256) != 0) { ret = -1; goto cleanup; }
+    if (wc_CBOR_EncodeInt(&c, COSE_ALG_ES256) != 0) { ret = -1; goto cleanup; }
     if (cbor_put_text(&c, "sig") != 0) { ret = -1; goto cleanup; }
-    if (cbor_put_bytes(&c, signature, (uint16_t)siglen) != 0) { ret = -1; goto cleanup; }
+    if (wc_CBOR_EncodeBstr(&c, signature, (size_t)siglen) != 0) { ret = -1; goto cleanup; }
     if (cbor_put_text(&c, "x5c") != 0) { ret = -1; goto cleanup; }
-    if (cbor_start_array(&c, 1) != 0) { ret = -1; goto cleanup; }
-    if (cbor_put_bytes(&c, cert_att_der, cert_att_der_len) != 0) { ret = -1; goto cleanup; }
+    if (wc_CBOR_EncodeArrayStart(&c, 1) != 0) { ret = -1; goto cleanup; }
+    if (wc_CBOR_EncodeBstr(&c, cert_att_der, cert_att_der_len) != 0) { ret = -1; goto cleanup; }
 
-    *reply_len = c.len;
+    *reply_len = (uint16_t)c.idx;
     ret = 0;
 
 cleanup:
@@ -1635,54 +1348,42 @@ static int ctap2_get_assertion(const uint8_t *payload, uint16_t payload_len,
                 break;
             }
             /* Parse next descriptor */
-            uint8_t major; uint32_t mitems; uint16_t cons;
-            const uint8_t *p = params.allow_list + allow_off;
-            uint16_t remain = (uint16_t)(params.allow_list_len - allow_off);
-            if (cbor_read_hdr(p, remain, &major, &mitems, &cons) != 0 || major != 5)
-                break;
-            p += cons; remain -= cons;
+            WOLFCOSE_CBOR_CTX ac;
+            uint32_t mitems;
             const uint8_t *desc_id = NULL; uint32_t desc_id_len = 0;
+            bool desc_ok = true;
+
+            cbor_dec_init(&ac, params.allow_list + allow_off,
+                          (uint16_t)(params.allow_list_len - allow_off));
+            if (cbor_read_map(&ac, &mitems) != 0)
+                break;
             for (uint32_t j = 0; j < mitems; j++) {
-                uint32_t mkey; uint16_t mkcons; uint16_t key_used = 0;
-                uint8_t key_major;
-                const uint8_t *tkey = NULL; uint32_t tlen = 0; uint16_t tcons = 0;
-                if (cbor_read_hdr(p, remain, &key_major, &mkey, &mkcons) != 0)
-                    break;
-                if (key_major == 3) {
-                    if (cbor_read_text(p, remain, &tkey, &tlen, &tcons) != 0)
-                        break;
-                    key_used = tcons;
-                } else if (key_major == 0) {
-                    key_used = mkcons;
-                } else {
+                struct cbor_key mkey;
+                if (cbor_read_key(&ac, &mkey) != 0) {
+                    desc_ok = false;
                     break;
                 }
-                if (remain < key_used)
+                if (cbor_key_is(&mkey, 1, "type")) {
+                    const uint8_t *tv; uint32_t tvlen;
+                    if (cbor_read_text(&ac, &tv, &tvlen) != 0) {
+                        desc_ok = false;
+                        break;
+                    }
+                } else if (cbor_key_is(&mkey, 2, "id")) {
+                    if (cbor_read_bytes(&ac, &desc_id, &desc_id_len) != 0) {
+                        desc_ok = false;
+                        break;
+                    }
+                } else if (wc_CBOR_Skip(&ac) != WOLFCOSE_SUCCESS) {
+                    desc_ok = false;
                     break;
-                p += key_used; remain -= key_used;
-                bool key_is_type = (key_major == 0 && mkey == 1) ||
-                                   (key_major == 3 && tlen == 4 && memcmp(tkey, "type", 4) == 0);
-                bool key_is_id = (key_major == 0 && mkey == 2) ||
-                                 (key_major == 3 && tlen == 2 && memcmp(tkey, "id", 2) == 0);
-                if (key_is_type) {
-                    const uint8_t *tv; uint32_t tlenv; uint16_t tvcons;
-                    if (cbor_read_text(p, remain, &tv, &tlenv, &tvcons) != 0)
-                        break;
-                    p += tvcons; remain -= tvcons;
-                } else if (key_is_id) {
-                    const uint8_t *idv; uint32_t idlen; uint16_t idcons;
-                    if (cbor_read_bytes(p, remain, &idv, &idlen, &idcons) != 0)
-                        break;
-                    desc_id = idv; desc_id_len = idlen;
-                    p += idcons; remain -= idcons;
-                } else {
-                    uint16_t skip;
-                    if (cbor_skip(p, remain, &skip) != 0)
-                        break;
-                    p += skip; remain -= skip;
                 }
             }
-            allow_off += (params.allow_list_len - remain - allow_off > 0) ? (uint32_t)((params.allow_list_len - remain) - allow_off) : 0;
+            /* Advance past whatever was consumed; a malformed descriptor
+             * ends the scan rather than looping on the same offset. */
+            allow_off += (uint32_t)ac.idx;
+            if (!desc_ok || ac.idx == 0)
+                break;
             if (desc_id && desc_id_len > 0) {
                 cid = desc_id;
                 cid_len = desc_id_len;
@@ -1773,11 +1474,12 @@ static int ctap2_get_assertion(const uint8_t *payload, uint16_t payload_len,
         if (wc_AesCbcEncrypt(&aes, salt_dec, hs_output, params.hs_salt_enc_len) != 0) { wc_AesFree(&aes); ret = CTAP2_ERR_INVALID_COMMAND; goto ga_cleanup; }
         wc_AesFree(&aes);
 
-        struct cbor_buf ext = {.buf = ext_buf, .cap = sizeof(ext_buf), .len = 0};
-        if (cbor_start_map(&ext, 1) != 0) { ret = CTAP2_ERR_INVALID_COMMAND; goto ga_cleanup; }
+        WOLFCOSE_CBOR_CTX ext;
+        cbor_enc_init(&ext, ext_buf, sizeof(ext_buf), 0);
+        if (wc_CBOR_EncodeMapStart(&ext, 1) != 0) { ret = CTAP2_ERR_INVALID_COMMAND; goto ga_cleanup; }
         if (cbor_put_text(&ext, "hmac-secret") != 0) { ret = CTAP2_ERR_INVALID_COMMAND; goto ga_cleanup; }
-        if (cbor_put_bytes(&ext, salt_dec, (uint16_t)params.hs_salt_enc_len) != 0) { ret = CTAP2_ERR_INVALID_COMMAND; goto ga_cleanup; }
-        ext_len = ext.len;
+        if (wc_CBOR_EncodeBstr(&ext, salt_dec, params.hs_salt_enc_len) != 0) { ret = CTAP2_ERR_INVALID_COMMAND; goto ga_cleanup; }
+        ext_len = (uint16_t)ext.idx;
         ForceZero(shared, sizeof(shared));
         ForceZero(mac, sizeof(mac));
         ForceZero(cred_random, sizeof(cred_random));
@@ -1804,24 +1506,25 @@ static int ctap2_get_assertion(const uint8_t *payload, uint16_t payload_len,
 
     device_counter_inc();
 
-    struct cbor_buf c = {.buf = reply, .cap = reply_max, .len = 1};
+    WOLFCOSE_CBOR_CTX c;
+    cbor_enc_init(&c, reply, reply_max, 1);
     reply[0] = CTAP2_ERR_SUCCESS;
-    if (cbor_start_map(&c, 4) != 0) { ret = -1; goto ga_cleanup; }
-    if (cbor_put_uint(&c, 1) != 0) { ret = -1; goto ga_cleanup; }
-    if (cbor_start_map(&c, 2) != 0) { ret = -1; goto ga_cleanup; }
+    if (wc_CBOR_EncodeMapStart(&c, 4) != 0) { ret = -1; goto ga_cleanup; }
+    if (wc_CBOR_EncodeUint(&c, 1) != 0) { ret = -1; goto ga_cleanup; }
+    if (wc_CBOR_EncodeMapStart(&c, 2) != 0) { ret = -1; goto ga_cleanup; }
     if (cbor_put_text(&c, "id") != 0) { ret = -1; goto ga_cleanup; }
-    if (cbor_put_bytes(&c, params.cred_id, (uint16_t)params.cred_id_len) != 0) { ret = -1; goto ga_cleanup; }
+    if (wc_CBOR_EncodeBstr(&c, params.cred_id, params.cred_id_len) != 0) { ret = -1; goto ga_cleanup; }
     if (cbor_put_text(&c, "type") != 0) { ret = -1; goto ga_cleanup; }
     if (cbor_put_text(&c, "public-key") != 0) { ret = -1; goto ga_cleanup; }
 
-    if (cbor_put_uint(&c, 2) != 0) { ret = -1; goto ga_cleanup; }
-    if (cbor_put_bytes(&c, authData, authDataLen) != 0) { ret = -1; goto ga_cleanup; }
-    if (cbor_put_uint(&c, 3) != 0) { ret = -1; goto ga_cleanup; }
-    if (cbor_put_bytes(&c, sigbuf, (uint16_t)siglen) != 0) { ret = -1; goto ga_cleanup; }
-    if (cbor_put_uint(&c, 5) != 0) { ret = -1; goto ga_cleanup; }
-    if (cbor_put_uint(&c, 1) != 0) { ret = -1; goto ga_cleanup; }
+    if (wc_CBOR_EncodeUint(&c, 2) != 0) { ret = -1; goto ga_cleanup; }
+    if (wc_CBOR_EncodeBstr(&c, authData, authDataLen) != 0) { ret = -1; goto ga_cleanup; }
+    if (wc_CBOR_EncodeUint(&c, 3) != 0) { ret = -1; goto ga_cleanup; }
+    if (wc_CBOR_EncodeBstr(&c, sigbuf, (size_t)siglen) != 0) { ret = -1; goto ga_cleanup; }
+    if (wc_CBOR_EncodeUint(&c, 5) != 0) { ret = -1; goto ga_cleanup; }
+    if (wc_CBOR_EncodeUint(&c, 1) != 0) { ret = -1; goto ga_cleanup; }
 
-    *reply_len = c.len;
+    *reply_len = (uint16_t)c.idx;
 
 ga_cleanup:
     wc_FreeRng(&rng);
@@ -1837,11 +1540,10 @@ ga_cleanup:
 static int ctap2_client_pin(const uint8_t *payload, uint16_t payload_len,
                             uint8_t *reply, uint16_t reply_max, uint16_t *reply_len)
 {
-    uint8_t major; uint32_t items; uint16_t cons;
-    const uint8_t *p = payload + 1;
-    uint16_t remain = payload_len - 1;
+    WOLFCOSE_CBOR_CTX c;
+    uint32_t items;
     uint32_t pinProtocol = 0, subCmd = 0;
-    const uint8_t *key_agree = NULL; uint32_t key_agree_len = 0;
+    const uint8_t *key_agree = NULL; uint16_t key_agree_len = 0;
     const uint8_t *pin_auth = NULL; uint32_t pin_auth_len = 0;
     const uint8_t *newPinEnc = NULL; uint32_t newPinEnc_len = 0;
     const uint8_t *pinHashEnc = NULL; uint32_t pinHashEnc_len = 0;
@@ -1854,71 +1556,48 @@ static int ctap2_client_pin(const uint8_t *payload, uint16_t payload_len,
 
     pin_state_load();
 
-    if (cbor_read_hdr(p, remain, &major, &items, &cons) != 0 || major != 5)
+    cbor_dec_init(&c, payload + 1, (uint16_t)(payload_len - 1));
+    if (cbor_read_map(&c, &items) != 0)
         return -1;
-    p += cons; remain -= cons;
     for (uint32_t i = 0; i < items; i++) {
-        uint32_t key; uint16_t kcons;
-        if (cbor_read_hdr(p, remain, &major, &key, &kcons) != 0 || major != 0)
+        uint64_t key;
+        if (wc_CBOR_DecodeUint(&c, &key) != WOLFCOSE_SUCCESS)
             return -1;
-        p += kcons; remain -= kcons;
         switch (key) {
             case 1: { /* pinProtocol */
-                uint8_t vmajor; uint32_t vval; uint16_t vcons;
-                if (cbor_read_hdr(p, remain, &vmajor, &vval, &vcons) != 0)
+                uint64_t v;
+                if (wc_CBOR_DecodeUint(&c, &v) != WOLFCOSE_SUCCESS)
                     return -1;
-                pinProtocol = vval;
-                p += vcons; remain -= vcons;
+                pinProtocol = (uint32_t)v;
                 break;
             }
             case 2: { /* subCmd */
-                uint8_t vmajor; uint32_t vval; uint16_t vcons;
-                if (cbor_read_hdr(p, remain, &vmajor, &vval, &vcons) != 0)
+                uint64_t v;
+                if (wc_CBOR_DecodeUint(&c, &v) != WOLFCOSE_SUCCESS)
                     return -1;
-                subCmd = vval;
-                p += vcons; remain -= vcons;
+                subCmd = (uint32_t)v;
                 break;
             }
-            case 3: { /* keyAgreement */
-                uint16_t skip;
-                if (cbor_skip(p, remain, &skip) != 0)
+            case 3: /* keyAgreement */
+                if (cbor_skip_slice(&c, &key_agree, &key_agree_len) != 0)
                     return -1;
-                key_agree = p;
-                key_agree_len = skip;
-                p += skip; remain -= skip;
                 break;
-            }
-            case 4: { /* pinAuth */
-                const uint8_t *pa; uint32_t palen; uint16_t vcons;
-                if (cbor_read_bytes(p, remain, &pa, &palen, &vcons) != 0)
+            case 4: /* pinAuth */
+                if (cbor_read_bytes(&c, &pin_auth, &pin_auth_len) != 0)
                     return -1;
-                pin_auth = pa; pin_auth_len = palen;
-                p += vcons; remain -= vcons;
                 break;
-            }
-            case 5: { /* newPinEnc */
-                const uint8_t *nv; uint32_t nlen; uint16_t vcons;
-                if (cbor_read_bytes(p, remain, &nv, &nlen, &vcons) != 0)
+            case 5: /* newPinEnc */
+                if (cbor_read_bytes(&c, &newPinEnc, &newPinEnc_len) != 0)
                     return -1;
-                newPinEnc = nv; newPinEnc_len = nlen;
-                p += vcons; remain -= vcons;
                 break;
-            }
-            case 6: { /* pinHashEnc */
-                const uint8_t *hv; uint32_t hlen; uint16_t vcons;
-                if (cbor_read_bytes(p, remain, &hv, &hlen, &vcons) != 0)
+            case 6: /* pinHashEnc */
+                if (cbor_read_bytes(&c, &pinHashEnc, &pinHashEnc_len) != 0)
                     return -1;
-                pinHashEnc = hv; pinHashEnc_len = hlen;
-                p += vcons; remain -= vcons;
                 break;
-            }
-            default: {
-                uint16_t skip;
-                if (cbor_skip(p, remain, &skip) != 0)
+            default:
+                if (wc_CBOR_Skip(&c) != WOLFCOSE_SUCCESS)
                     return -1;
-                p += skip; remain -= skip;
                 break;
-            }
         }
     }
 
@@ -1928,44 +1607,37 @@ static int ctap2_client_pin(const uint8_t *payload, uint16_t payload_len,
 
     switch (subCmd) {
         case 1: { /* getRetries */
-            struct cbor_buf c = {.buf = reply, .cap = reply_max, .len = 1};
+            WOLFCOSE_CBOR_CTX rc;
+            cbor_enc_init(&rc, reply, reply_max, 1);
             reply[0] = CTAP2_ERR_SUCCESS;
-            if (cbor_start_map(&c, 1) != 0) return -1;
-            if (cbor_put_uint(&c, 3) != 0) return -1; /* PIN_RETRIES */
-            if (cbor_put_uint(&c, pin_store.retries) != 0) return -1;
-            *reply_len = c.len;
+            if (wc_CBOR_EncodeMapStart(&rc, 1) != 0) return -1;
+            if (wc_CBOR_EncodeUint(&rc, 3) != 0) return -1; /* PIN_RETRIES */
+            if (wc_CBOR_EncodeUint(&rc, pin_store.retries) != 0) return -1;
+            *reply_len = (uint16_t)rc.idx;
             return 0;
         }
         case 2: { /* getKeyAgreement */
+            WOLFCOSE_CBOR_CTX rc;
             wc_InitRng(&rng);
             if (pin_generate_agreement_key(&rng) != 0) {
                 wc_FreeRng(&rng);
                 reply[0] = CTAP2_ERR_INVALID_COMMAND; *reply_len = 1; return 0;
             }
             wc_FreeRng(&rng);
-            struct cbor_buf c = {.buf = reply, .cap = reply_max, .len = 1};
+            cbor_enc_init(&rc, reply, reply_max, 1);
             reply[0] = CTAP2_ERR_SUCCESS;
-            if (cbor_start_map(&c, 1) != 0) return -1;
-            if (cbor_put_uint(&c, 1) != 0) return -1;
-            if (cbor_start_map(&c, 5) != 0) return -1;
-            if (cbor_put_int(&c, COSE_KEY_KTY_LABEL) != 0) return -1;
-            if (cbor_put_uint(&c, COSE_KTY_EC2) != 0) return -1;
-            if (cbor_put_int(&c, COSE_KEY_ALG_LABEL) != 0) return -1;
-            if (cbor_put_int(&c, COSE_ALG_ECDH_ES_HKDF256) != 0) return -1;
-            if (cbor_put_int(&c, COSE_KEY_CRV_LABEL) != 0) return -1;
-            if (cbor_put_uint(&c, COSE_CRV_P256) != 0) return -1;
-            if (cbor_put_int(&c, COSE_KEY_X_LABEL) != 0) return -1;
-            if (cbor_put_bytes(&c, pin_agree_qx, ECC_SZ) != 0) return -1;
-            if (cbor_put_int(&c, COSE_KEY_Y_LABEL) != 0) return -1;
-            if (cbor_put_bytes(&c, pin_agree_qy, ECC_SZ) != 0) return -1;
-            *reply_len = c.len;
+            if (wc_CBOR_EncodeMapStart(&rc, 1) != 0) return -1;
+            if (wc_CBOR_EncodeUint(&rc, 1) != 0) return -1;
+            if (encode_cose_pubkey(&rc, &pin_agree_key,
+                                   COSE_ALG_ECDH_ES_HKDF256) != 0) return -1;
+            *reply_len = (uint16_t)rc.idx;
             return 0;
         }
         case 3: { /* setPIN */
             if (pin_store.magic == FLASH_PIN_MAGIC) {
                 reply[0] = CTAP2_ERR_PIN_AUTH_INVALID; *reply_len = 1; return 0;
             }
-            if (!key_agree || !pin_agree_valid || parse_cose_pubkey(key_agree, (uint16_t)key_agree_len, platform_qx, platform_qy) != 0) {
+            if (!key_agree || !pin_agree_valid || parse_cose_pubkey(key_agree, key_agree_len, platform_qx, platform_qy) != 0) {
                 reply[0] = CTAP2_ERR_INVALID_CBOR; *reply_len = 1; return 0;
             }
             if (!pin_auth || pin_auth_len != 16 || !newPinEnc || newPinEnc_len != 64) {
@@ -2006,10 +1678,11 @@ static int ctap2_client_pin(const uint8_t *payload, uint16_t payload_len,
             wc_InitRng(&rng);
             pin_reset_token(&rng);
             wc_FreeRng(&rng);
-            struct cbor_buf c = {.buf = reply, .cap = reply_max, .len = 1};
+            WOLFCOSE_CBOR_CTX rc;
+            cbor_enc_init(&rc, reply, reply_max, 1);
             reply[0] = CTAP2_ERR_SUCCESS;
-            if (cbor_start_map(&c, 0) != 0) return -1;
-            *reply_len = c.len;
+            if (wc_CBOR_EncodeMapStart(&rc, 0) != 0) return -1;
+            *reply_len = (uint16_t)rc.idx;
             return 0;
         }
         case 4: { /* changePIN */
@@ -2019,7 +1692,7 @@ static int ctap2_client_pin(const uint8_t *payload, uint16_t payload_len,
             if (pin_check_retries() != 0) {
                 reply[0] = CTAP2_ERR_PIN_BLOCKED; *reply_len = 1; return 0;
             }
-            if (!key_agree || !pin_agree_valid || parse_cose_pubkey(key_agree, (uint16_t)key_agree_len, platform_qx, platform_qy) != 0) {
+            if (!key_agree || !pin_agree_valid || parse_cose_pubkey(key_agree, key_agree_len, platform_qx, platform_qy) != 0) {
                 reply[0] = CTAP2_ERR_INVALID_CBOR; *reply_len = 1; return 0;
             }
             if (!pin_auth || pin_auth_len != 16 || !newPinEnc || newPinEnc_len != 64 || !pinHashEnc || pinHashEnc_len != 16) {
@@ -2074,10 +1747,11 @@ static int ctap2_client_pin(const uint8_t *payload, uint16_t payload_len,
             wc_InitRng(&rng);
             pin_reset_token(&rng);
             wc_FreeRng(&rng);
-            struct cbor_buf c = {.buf = reply, .cap = reply_max, .len = 1};
+            WOLFCOSE_CBOR_CTX rc;
+            cbor_enc_init(&rc, reply, reply_max, 1);
             reply[0] = CTAP2_ERR_SUCCESS;
-            if (cbor_start_map(&c, 0) != 0) return -1;
-            *reply_len = c.len;
+            if (wc_CBOR_EncodeMapStart(&rc, 0) != 0) return -1;
+            *reply_len = (uint16_t)rc.idx;
             return 0;
         }
         case 5: { /* getPINToken */
@@ -2087,7 +1761,7 @@ static int ctap2_client_pin(const uint8_t *payload, uint16_t payload_len,
             if (pin_check_retries() != 0) {
                 reply[0] = CTAP2_ERR_PIN_BLOCKED; *reply_len = 1; return 0;
             }
-            if (!key_agree || !pin_agree_valid || parse_cose_pubkey(key_agree, (uint16_t)key_agree_len, platform_qx, platform_qy) != 0) {
+            if (!key_agree || !pin_agree_valid || parse_cose_pubkey(key_agree, key_agree_len, platform_qx, platform_qy) != 0) {
                 reply[0] = CTAP2_ERR_INVALID_CBOR; *reply_len = 1; return 0;
             }
             if (!pinHashEnc || pinHashEnc_len != 16) {
@@ -2122,12 +1796,13 @@ static int ctap2_client_pin(const uint8_t *payload, uint16_t payload_len,
                 if (wc_AesSetKey(&aes, shared + 32, 32, iv, AES_ENCRYPTION) != 0) { wc_AesFree(&aes); wc_FreeRng(&rng); reply[0] = CTAP2_ERR_PIN_AUTH_INVALID; *reply_len = 1; return 0; }
                 if (wc_AesCbcEncrypt(&aes, tmp, pin_token, sizeof(pin_token)) != 0) { wc_AesFree(&aes); wc_FreeRng(&rng); reply[0] = CTAP2_ERR_PIN_AUTH_INVALID; *reply_len = 1; return 0; }
                 wc_AesFree(&aes);
-                struct cbor_buf c = {.buf = reply, .cap = reply_max, .len = 1};
+                WOLFCOSE_CBOR_CTX rc;
+                cbor_enc_init(&rc, reply, reply_max, 1);
                 reply[0] = CTAP2_ERR_SUCCESS;
-                if (cbor_start_map(&c, 1) != 0) { wc_FreeRng(&rng); return -1; }
-                if (cbor_put_uint(&c, 2) != 0) { wc_FreeRng(&rng); return -1; }
-                if (cbor_put_bytes(&c, tmp, enc_len) != 0) { wc_FreeRng(&rng); return -1; }
-                *reply_len = c.len;
+                if (wc_CBOR_EncodeMapStart(&rc, 1) != 0) { wc_FreeRng(&rng); return -1; }
+                if (wc_CBOR_EncodeUint(&rc, 2) != 0) { wc_FreeRng(&rng); return -1; }
+                if (wc_CBOR_EncodeBstr(&rc, tmp, enc_len) != 0) { wc_FreeRng(&rng); return -1; }
+                *reply_len = (uint16_t)rc.idx;
                 wc_FreeRng(&rng);
                 return 0;
             }
