@@ -418,8 +418,15 @@ static uint16_t fido_auth(struct u2f_raw_hdr *hdr, uint16_t len)
         case 0x08: /* Sign with no presence */
             break;
         case 0x03:
+            /* "enforce-user-presence-and-sign": the button was pressed, so
+             * the response must say so. This byte is both returned to the
+             * relying party and hashed into the signature, so leaving it at
+             * zero makes every U2F login fail with "User Present flag not
+             * set" -- the verifier is reading exactly what we sent.
+             */
             if (!indicator_wait_for_button(0,0,0x20))
                 return ECOND;
+            user_presence = 0x01;
             break;
         default:
             return EWRONGDATA;
