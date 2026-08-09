@@ -58,6 +58,7 @@ target_sources(${PROJECT} PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/src/rand.c
         ${CMAKE_CURRENT_SOURCE_DIR}/src/puf_sram.c
         ${CMAKE_CURRENT_SOURCE_DIR}/src/flash_rt.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/cred_alg.c
         ${CMAKE_CURRENT_SOURCE_DIR}/src/alg_probe.c
         ${CMAKE_CURRENT_SOURCE_DIR}/src/cert.c
         ${CMAKE_CURRENT_SOURCE_DIR}/src/ctap2.c
@@ -129,6 +130,10 @@ target_compile_definitions( ${PROJECT} PUBLIC ${FIDELIO_BOARD_DEFINE})
 # on by default.
 target_compile_definitions( ${PROJECT} PUBLIC
         WOLFCOSE_LEAN
+        # LEAN turns the optional key types off; re-enable the ones whose
+        # COSE_Key serialisation Fidelio needs for its credential algorithms.
+        WOLFCOSE_ENABLE_EDDSA
+        WOLFCOSE_ENABLE_MLDSA
         WOLFCOSE_NO_SIGN1
         WOLFCOSE_NO_ENCRYPT0
         WOLFCOSE_NO_MAC0

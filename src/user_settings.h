@@ -33,6 +33,7 @@
 #define HAVE_SHA256
 #define HAVE_SHA512
 #define WOLFSSL_SHA512
+#define WOLFSSL_SHA384
 #define HAVE_HASHDRBG
 #define HAVE_HKDF
 

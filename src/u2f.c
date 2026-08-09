@@ -193,7 +193,13 @@ struct __attribute__((packed)) u2f_raw_hdr {
 #define CTAP_KEEPALIVE			0x3b
 #define CTAP_FRAME_INIT			0x80
 
-#define RESPONSE_MAX_SIZE 2048
+/* Must hold the largest CTAP2 reply. An ML-DSA-87 assertion is a 4627-byte
+ * signature plus authData and the credential descriptor; a makeCredential
+ * carries a 2592-byte public key inside authData plus the attestation
+ * certificate. 8 KiB covers both and still fits the CTAPHID ceiling of 7609
+ * payload bytes per message.
+ */
+#define RESPONSE_MAX_SIZE CTAP2_MAX_MSG_SIZE
 
 #define VALID_CID 0x00000000
 

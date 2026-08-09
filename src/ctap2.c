@@ -21,6 +21,8 @@
 #include "wolfssl/wolfcrypt/aes.h"
 #include "fdo.h"
 #include "indicator.h"
+#include "cred_alg.h"
+#include "wolfssl/wolfcrypt/puf.h"
 #include "wolfcose/wolfcose.h"
 
 extern void ForceZero(void* mem, word32 len);
@@ -71,6 +73,19 @@ extern void ForceZero(void* mem, word32 len);
 #define RK_MAX_SLOTS       8
 
 #define CTAP2_CMD_RESET           0x07
+
+/* Credential ID: alg(1) || nonce(32) || tag(32).
+ *
+ * Fidelio stores nothing per credential, so the ID must carry everything
+ * needed to reconstruct the key: which algorithm it is, and the nonce that
+ * salts the derivation. The tag is a MAC over both under the device master
+ * secret, so an attacker can neither forge a credential for another relying
+ * party nor rewrite the algorithm byte to force a downgrade to the weakest
+ * one on offer. It is also checked before any key derivation runs, so a
+ * bogus ID costs a HMAC rather than an ML-DSA keygen.
+ */
+#define CRED_ID_LEN (1 + NONCE_SZ + HASH_SZ)
+
 
 /* CBOR (RFC 8949) encoding and decoding is provided by wolfCOSE. The thin
  * wrappers below only set up a WOLFCOSE_CBOR_CTX and keep the call sites
@@ -209,7 +224,7 @@ struct rk_slot {
     uint8_t magic[4];
     uint8_t rpIdHash[HASH_SZ];
     uint8_t user_handle[32];
-    uint8_t cred_id[NONCE_SZ + HASH_SZ];
+    uint8_t cred_id[CRED_ID_LEN];
     uint16_t cred_id_len;
     uint8_t pub_qx[ECC_SZ];
     uint8_t pub_qy[ECC_SZ];
@@ -462,70 +477,110 @@ static int pin_require_for_op(const uint8_t *pin_auth, uint32_t pin_auth_len,
         *verified = true;
     return 0;
 }
-static int derive_user_key(const uint8_t *rpIdHash, const uint8_t *nonce,
-                           uint8_t *private_out, uint8_t *handle_hash)
+static int cred_tag(uint8_t alg_id, const uint8_t *rpIdHash,
+                    const uint8_t *nonce, uint8_t *tag_out)
 {
     Hmac hmac;
-    int ret;
     const uint8_t *secret = device_get_secret();
+    int ret;
 
+    if (secret == NULL)
+        return -1;
     ret = wc_HmacInit(&hmac, NULL, 0);
     if (ret != 0)
-        return ret;
-    ret = wc_HmacSetKey(&hmac, SHA256, secret, ECC_SZ);
-    if (ret != 0)
-        return ret;
-    wc_HmacUpdate(&hmac, rpIdHash, HASH_SZ);
-    wc_HmacUpdate(&hmac, nonce, NONCE_SZ);
-    wc_HmacFinal(&hmac, private_out);
+        return -1;
+    ret = wc_HmacSetKey(&hmac, WC_SHA256, secret, WC_PUF_KEY_SZ);
+    if (ret == 0) {
+        wc_HmacUpdate(&hmac, &alg_id, 1);
+        wc_HmacUpdate(&hmac, rpIdHash, HASH_SZ);
+        wc_HmacUpdate(&hmac, nonce, NONCE_SZ);
+        ret = wc_HmacFinal(&hmac, tag_out);
+    }
     wc_HmacFree(&hmac);
+    return (ret == 0) ? 0 : -1;
+}
 
-    ret = wc_HmacInit(&hmac, NULL, 0);
-    if (ret != 0)
-        return ret;
-    ret = wc_HmacSetKey(&hmac, SHA256, secret, ECC_SZ);
-    if (ret != 0)
-        return ret;
-    wc_HmacUpdate(&hmac, rpIdHash, HASH_SZ);
-    wc_HmacUpdate(&hmac, private_out, ECC_SZ);
-    wc_HmacFinal(&hmac, handle_hash);
-    wc_HmacFree(&hmac);
+/* Constant-time compare: the tag check gates credential validity, so an
+ * early-exit memcmp would leak how much of a forged tag was correct.
+ */
+static int ct_memeq(const uint8_t *a, const uint8_t *b, uint16_t len)
+{
+    uint8_t diff = 0;
+    uint16_t i;
+    for (i = 0; i < len; i++)
+        diff |= (uint8_t)(a[i] ^ b[i]);
+    return diff == 0;
+}
 
+/* Validate a credential ID against this relying party and, if it checks out,
+ * derive the key it names.
+ */
+static int cred_open(const uint8_t *credId, uint16_t credIdLen,
+                     const uint8_t *rpIdHash, struct cred_key *key_out,
+                     const struct cred_alg **alg_out)
+{
+    const struct cred_alg *alg;
+    uint8_t tag[HASH_SZ];
+    int ok;
+
+    if (credIdLen != CRED_ID_LEN)
+        return -1;
+    alg = cred_alg_by_id(credId[0]);
+    if (alg == NULL)
+        return -1;
+    if (cred_tag(credId[0], rpIdHash, credId + 1, tag) != 0)
+        return -1;
+    ok = ct_memeq(tag, credId + 1 + NONCE_SZ, HASH_SZ);
+    ForceZero(tag, sizeof(tag));
+    if (!ok)
+        return -1;
+    if (cred_alg_derive(alg, device_get_secret(), rpIdHash, credId + 1,
+                        key_out) != 0)
+        return -1;
+    if (alg_out)
+        *alg_out = alg;
     return 0;
 }
 
-static int derive_cred_random(const uint8_t *rpIdHash, const uint8_t *credId, uint16_t credIdLen,
-                              const uint8_t *priv_key, uint8_t *cred_random)
+/* hmac-secret's per-credential seed. Bound to the master secret rather than
+ * to the credential private key, so it is independent of the algorithm and
+ * does not require the signing key to still be in scope.
+ */
+static int derive_cred_random(const uint8_t *rpIdHash, const uint8_t *credId,
+                              uint16_t credIdLen, uint8_t *cred_random)
 {
     Hmac hmac;
+    const uint8_t *secret = device_get_secret();
+    static const char label[] = "fidelio-hmac-secret";
+    int ret;
+
+    if (secret == NULL)
+        return -1;
     if (wc_HmacInit(&hmac, NULL, 0) != 0)
         return -1;
-    if (wc_HmacSetKey(&hmac, SHA256, priv_key, ECC_SZ) != 0) {
-        wc_HmacFree(&hmac);
-        return -1;
+    ret = wc_HmacSetKey(&hmac, WC_SHA256, secret, WC_PUF_KEY_SZ);
+    if (ret == 0) {
+        wc_HmacUpdate(&hmac, (const byte *)label, sizeof(label) - 1);
+        wc_HmacUpdate(&hmac, rpIdHash, HASH_SZ);
+        wc_HmacUpdate(&hmac, credId, credIdLen);
+        ret = wc_HmacFinal(&hmac, cred_random);
     }
-    wc_HmacUpdate(&hmac, rpIdHash, HASH_SZ);
-    wc_HmacUpdate(&hmac, credId, credIdLen);
-    wc_HmacFinal(&hmac, cred_random);
     wc_HmacFree(&hmac);
-    return 0;
+    return (ret == 0) ? 0 : -1;
 }
 
-static int build_credential_id(WC_RNG *rng, const uint8_t *rpIdHash,
-                               uint8_t *credId, uint16_t credIdCap, uint16_t *credIdLen,
-                               uint8_t *user_private)
+static int build_credential_id(WC_RNG *rng, const struct cred_alg *alg,
+                               const uint8_t *rpIdHash, uint8_t *credId,
+                               uint16_t credIdCap, uint16_t *credIdLen)
 {
-    uint8_t nonce[NONCE_SZ];
-    uint8_t handle_hash[HASH_SZ];
-    if (credIdCap < (NONCE_SZ + HASH_SZ))
+    if (credIdCap < CRED_ID_LEN)
         return -1;
-    if (wc_RNG_GenerateBlock(rng, nonce, NONCE_SZ) != 0)
+    if (wc_RNG_GenerateBlock(rng, credId + 1, NONCE_SZ) != 0)
         return -1;
-    if (derive_user_key(rpIdHash, nonce, user_private, handle_hash) != 0)
+    credId[0] = alg->id;
+    if (cred_tag(alg->id, rpIdHash, credId + 1, credId + 1 + NONCE_SZ) != 0)
         return -1;
-    memcpy(credId, nonce, NONCE_SZ);
-    memcpy(credId + NONCE_SZ, handle_hash, HASH_SZ);
-    *credIdLen = NONCE_SZ + HASH_SZ;
+    *credIdLen = CRED_ID_LEN;
     return 0;
 }
 
@@ -559,7 +614,7 @@ static int encode_cose_pubkey(WOLFCOSE_CBOR_CTX *c, ecc_key *ecc, int32_t alg)
 
 static int build_authdata_attested(const uint8_t *rpIdHash, uint8_t flags, uint32_t counter,
                                    const uint8_t *credId, uint16_t credIdLen,
-                                   ecc_key *pubkey,
+                                   struct cred_key *pubkey,
                                    uint8_t *authData, uint16_t authDataCap, uint16_t *authDataLen)
 {
     uint8_t aaguid[16] = {0};
@@ -588,7 +643,7 @@ static int build_authdata_attested(const uint8_t *rpIdHash, uint8_t flags, uint3
     idx += credIdLen;
 
     cbor_enc_init(&cose, &authData[idx], (uint16_t)(authDataCap - idx), 0);
-    if (encode_cose_pubkey(&cose, pubkey, COSE_ALG_ES256) != 0)
+    if (cred_alg_pubkey_cose(pubkey, &cose) != 0)
         return -1;
     idx += (uint16_t)cose.idx;
     *authDataLen = idx;
@@ -666,7 +721,7 @@ struct mc_params {
     uint32_t cdh_len;
     const uint8_t *rp_id;
     uint32_t rp_id_len;
-    bool es256_ok;
+    uint32_t alg_mask;   /* bitmap of (1u << CRED_ALG_*) the RP accepts */
     bool uv_required;
     const uint8_t *pin_auth;
     uint32_t pin_auth_len;
@@ -794,6 +849,7 @@ static int parse_makecred(const uint8_t *buf, uint16_t len, struct mc_params *ou
                     uint32_t mitems;
                     bool type_ok = false;
                     bool alg_ok = false;
+                    uint8_t cand = 0;
                     if (cbor_read_map(&c, &mitems) != 0)
                         return -1;
                     for (uint32_t k = 0; k < mitems; k++) {
@@ -810,14 +866,22 @@ static int parse_makecred(const uint8_t *buf, uint16_t len, struct mc_params *ou
                             int64_t aval;
                             if (wc_CBOR_DecodeInt(&c, &aval) != WOLFCOSE_SUCCESS)
                                 return -1;
-                            if (aval == COSE_ALG_ES256)
-                                alg_ok = true;
+                            {
+                                const struct cred_alg *a =
+                                    cred_alg_by_cose((int32_t)aval);
+                                if (a != NULL) {
+                                    alg_ok = true;
+                                    cand = a->id;
+                                }
+                            }
                         } else if (wc_CBOR_Skip(&c) != WOLFCOSE_SUCCESS) {
                             return -1;
                         }
                     }
-                    if (type_ok && alg_ok)
-                        out->es256_ok = true;
+                    /* Record every algorithm the RP will accept; the
+                     * strongest is chosen once the whole list is known. */
+                    if (type_ok && alg_ok && cand != 0)
+                        out->alg_mask |= (1u << cand);
                 }
                 break;
             }
@@ -863,7 +927,7 @@ static int parse_makecred(const uint8_t *buf, uint16_t len, struct mc_params *ou
         return -1;
     if (!out->rp_id || out->rp_id_len == 0)
         return -1;
-    if (!out->es256_ok)
+    if (out->alg_mask == 0)
         return -1;
     return 0;
 }
@@ -1095,7 +1159,7 @@ static int ctap2_write_getinfo(uint8_t *reply, uint16_t reply_max, uint16_t *rep
 
     /* 5: maxMsgSize */
     if (wc_CBOR_EncodeUint(&c, 5) != 0) return -1;
-    if (wc_CBOR_EncodeUint(&c, 1024) != 0) return -1;
+    if (wc_CBOR_EncodeUint(&c, CTAP2_MAX_MSG_SIZE) != 0) return -1;
 
     /* 6: pinProtocols */
     if (wc_CBOR_EncodeUint(&c, 6) != 0) return -1;
@@ -1108,9 +1172,28 @@ static int ctap2_write_getinfo(uint8_t *reply, uint16_t reply_max, uint16_t *rep
 
     /* 8: maxCredentialIdLength */
     if (wc_CBOR_EncodeUint(&c, 8) != 0) return -1;
-    if (wc_CBOR_EncodeUint(&c, 128) != 0) return -1;
+    if (wc_CBOR_EncodeUint(&c, CRED_ID_LEN) != 0) return -1;
 
-    /* (algorithms omitted for now; add back when stable) */
+    /* 0x0A: algorithms, in Fidelio's order of preference (strongest first),
+     * each as a PublicKeyCredentialParameters map. A relying party that
+     * cares can read this instead of guessing.
+     */
+    {
+        unsigned n = 0, i;
+        while (cred_alg_at(n) != NULL)
+            n++;
+        if (wc_CBOR_EncodeUint(&c, 0x0A) != 0) return -1;
+        if (wc_CBOR_EncodeArrayStart(&c, n) != 0) return -1;
+        /* cred_alg_at() is ordered weakest-first; emit in reverse. */
+        for (i = n; i > 0; i--) {
+            const struct cred_alg *a = cred_alg_at(i - 1);
+            if (wc_CBOR_EncodeMapStart(&c, 2) != 0) return -1;
+            if (cbor_put_text(&c, "alg") != 0) return -1;
+            if (wc_CBOR_EncodeInt(&c, a->cose) != 0) return -1;
+            if (cbor_put_text(&c, "type") != 0) return -1;
+            if (cbor_put_text(&c, "public-key") != 0) return -1;
+        }
+    }
 
     *reply_len = (uint16_t)c.idx;
     return 0;
@@ -1120,21 +1203,22 @@ static int ctap2_make_credential(const uint8_t *payload, uint16_t payload_len,
                                  uint8_t *reply, uint16_t reply_max, uint16_t *reply_len)
 {
     struct mc_params params;
+    const struct cred_alg *alg;
+    struct cred_key user_key;
     uint8_t rpIdHash[HASH_SZ];
-    uint8_t authData[256];
+    static uint8_t authData[CRED_PUB_MAX + 256];
     uint16_t authDataLen = 0;
-    uint8_t credId[NONCE_SZ + HASH_SZ];
+    uint8_t credId[CRED_ID_LEN];
     uint16_t credIdLen = 0;
     uint8_t signature[SIGMAX_SZ];
     word32 siglen = SIGMAX_SZ;
     uint8_t digest[HASH_SZ];
-    uint8_t user_private[ECC_SZ];
-    uint8_t qx[ECC_SZ], qy[ECC_SZ];
     wc_Sha256 sha;
     WC_RNG rng;
-    ecc_key user_ecc;
     ecc_key cert_ecc;
     int ret;
+
+    memset(&user_key, 0, sizeof(user_key));
 
     if (parse_makecred(payload + 1, payload_len - 1, &params) != 0) {
         reply[0] = CTAP2_ERR_INVALID_CBOR;
@@ -1166,6 +1250,19 @@ static int ctap2_make_credential(const uint8_t *payload, uint16_t payload_len,
         return 0;
     }
 
+    /* Pick the strongest algorithm the relying party is willing to accept.
+     * WebAuthn states pubKeyCredParams in the RP's order of preference; this
+     * deliberately overrides that in favour of the strongest mutually
+     * supported option, which on this hardware also happens to be affordable
+     * (ML-DSA-87 derive+sign worst case 513 ms at 125 MHz).
+     */
+    alg = cred_alg_best(params.alg_mask);
+    if (alg == NULL) {
+        reply[0] = CTAP2_ERR_UNSUPPORTED_ALGORITHM;
+        *reply_len = 1;
+        return 0;
+    }
+
     wc_InitSha256(&sha);
     wc_Sha256Update(&sha, params.rp_id, params.rp_id_len);
     wc_Sha256Final(&sha, rpIdHash);
@@ -1180,26 +1277,19 @@ static int ctap2_make_credential(const uint8_t *payload, uint16_t payload_len,
         return 0;
     }
 
-    if (build_credential_id(&rng, rpIdHash, credId, sizeof(credId), &credIdLen, user_private) != 0) {
+    if (build_credential_id(&rng, alg, rpIdHash, credId, sizeof(credId),
+                            &credIdLen) != 0) {
         wc_FreeRng(&rng);
         reply[0] = CTAP2_ERR_INVALID_COMMAND;
         *reply_len = 1;
         return 0;
     }
 
-    wc_ecc_init(&user_ecc);
     wc_ecc_init(&cert_ecc);
 
     word32 inOutIdx = 0;
-    if (wc_ecc_import_private_key_ex(user_private, ECC_SZ, NULL, 0, &user_ecc, ECC_SECP256R1) != 0) {
-        ret = -1; goto cleanup;
-    }
-    if (wc_ecc_make_pub_ex(&user_ecc, NULL, NULL) != 0) {
-        ret = -1; goto cleanup;
-    }
-
-    word32 qxlen = ECC_SZ, qylen = ECC_SZ;
-    if (wc_ecc_export_public_raw(&user_ecc, qx, &qxlen, qy, &qylen) != 0) {
+    if (cred_alg_derive(alg, device_get_secret(), rpIdHash, credId + 1,
+                        &user_key) != 0) {
         ret = -1; goto cleanup;
     }
 
@@ -1214,8 +1304,6 @@ static int ctap2_make_credential(const uint8_t *payload, uint16_t payload_len,
             rk_slots[slot].counter = device_get_counter();
             if (params.user_handle && params.user_handle_len <= sizeof(rk_slots[slot].user_handle))
                 memcpy(rk_slots[slot].user_handle, params.user_handle, params.user_handle_len);
-            memcpy(rk_slots[slot].pub_qx, qx, ECC_SZ);
-            memcpy(rk_slots[slot].pub_qy, qy, ECC_SZ);
             rk_save();
         }
     }
@@ -1231,7 +1319,7 @@ static int ctap2_make_credential(const uint8_t *payload, uint16_t payload_len,
     if (pin_store.magic == FLASH_PIN_MAGIC && params.pin_auth && params.pin_auth_len == 16)
         flags |= 0x04;
 
-    if (build_authdata_attested(rpIdHash, flags, device_get_counter(), credId, credIdLen, &user_ecc,
+    if (build_authdata_attested(rpIdHash, flags, device_get_counter(), credId, credIdLen, &user_key,
                                 authData, sizeof(authData), &authDataLen) != 0) {
         ret = -1; goto cleanup;
     }
@@ -1273,9 +1361,9 @@ static int ctap2_make_credential(const uint8_t *payload, uint16_t payload_len,
 
 cleanup:
     wc_FreeRng(&rng);
-    wc_ecc_free(&user_ecc);
+    cred_key_free(&user_key);
     wc_ecc_free(&cert_ecc);
-    ForceZero(user_private, sizeof(user_private));
+    ForceZero(digest, sizeof(digest));
     if (ret != 0) {
         reply[0] = CTAP2_ERR_INVALID_COMMAND;
         *reply_len = 1;
@@ -1288,20 +1376,20 @@ static int ctap2_get_assertion(const uint8_t *payload, uint16_t payload_len,
                                uint8_t *reply, uint16_t reply_max, uint16_t *reply_len)
 {
     struct ga_params params;
+    struct cred_key user_key;
     uint8_t rpIdHash[HASH_SZ];
-    uint8_t private[ECC_SZ];
-    uint8_t handle_hash[HASH_SZ];
-    uint8_t authData[256];
+    static uint8_t authData[CRED_PUB_MAX + 256];
     uint16_t authDataLen = 0;
     uint8_t ext_buf[128];
     uint16_t ext_len = 0;
-    uint8_t sigbuf[SIGMAX_SZ];
-    uint8_t digest[HASH_SZ];
-    word32 siglen = SIGMAX_SZ;
+    static uint8_t sigbuf[CRED_SIG_MAX];
+    static uint8_t signed_msg[CRED_PUB_MAX + 320];
+    uint16_t siglen = sizeof(sigbuf);
     wc_Sha256 sha;
-    ecc_key user_ecc;
     WC_RNG rng;
     int ret = 0;
+
+    memset(&user_key, 0, sizeof(user_key));
 
     if (parse_getassert(payload + 1, payload_len - 1, &params) != 0) {
         reply[0] = CTAP2_ERR_INVALID_CBOR;
@@ -1393,12 +1481,12 @@ static int ctap2_get_assertion(const uint8_t *payload, uint16_t payload_len,
             }
         }
 
-        if (cid_len != (NONCE_SZ + HASH_SZ)) {
+        if (cid_len != CRED_ID_LEN) {
             continue;
         }
-        if (derive_user_key(rpIdHash, cid, private, handle_hash) != 0)
-            continue;
-        if (memcmp(handle_hash, cid + NONCE_SZ, HASH_SZ) != 0)
+        /* Authenticates the credential ID and derives its key in one step;
+         * a forged or foreign ID is rejected before any keygen runs. */
+        if (cred_open(cid, (uint16_t)cid_len, rpIdHash, &user_key, NULL) != 0)
             continue;
         /* found matching cred */
         params.cred_id = cid;
@@ -1420,14 +1508,6 @@ static int ctap2_get_assertion(const uint8_t *payload, uint16_t payload_len,
         reply[0] = CTAP2_ERR_INVALID_COMMAND;
         *reply_len = 1;
         return 0;
-    }
-
-    wc_ecc_init(&user_ecc);
-    if (wc_ecc_import_private_key_ex(private, ECC_SZ, NULL, 0, &user_ecc, ECC_SECP256R1) != 0) {
-        ret = -1; goto ga_cleanup;
-    }
-    if (wc_ecc_make_pub_ex(&user_ecc, NULL, NULL) != 0) {
-        ret = -1; goto ga_cleanup;
     }
 
     uint8_t flags = 0x01;
@@ -1459,7 +1539,7 @@ static int ctap2_get_assertion(const uint8_t *payload, uint16_t payload_len,
         if (wc_AesCbcDecrypt(&aes, salt_dec, params.hs_salt_enc, params.hs_salt_enc_len) != 0) { wc_AesFree(&aes); ret = CTAP2_ERR_PIN_AUTH_INVALID; goto ga_cleanup; }
         wc_AesFree(&aes);
 
-        if (derive_cred_random(rpIdHash, params.cred_id, (uint16_t)params.cred_id_len, private, cred_random) != 0) { ret = CTAP2_ERR_INVALID_COMMAND; goto ga_cleanup; }
+        if (derive_cred_random(rpIdHash, params.cred_id, (uint16_t)params.cred_id_len, cred_random) != 0) { ret = CTAP2_ERR_INVALID_COMMAND; goto ga_cleanup; }
         uint16_t salt_blocks = (uint16_t)(params.hs_salt_enc_len / 32);
         for (uint16_t i = 0; i < salt_blocks; i++) {
             if (wc_HmacInit(&hmac, NULL, 0) != 0) { ret = CTAP2_ERR_INVALID_COMMAND; goto ga_cleanup; }
@@ -1494,16 +1574,21 @@ static int ctap2_get_assertion(const uint8_t *payload, uint16_t payload_len,
         ret = -1; goto ga_cleanup;
     }
 
-    wc_InitSha256(&sha);
-    wc_Sha256Update(&sha, authData, authDataLen);
-    wc_Sha256Update(&sha, params.clientDataHash, params.cdh_len);
-    wc_Sha256Final(&sha, digest);
-    wc_Sha256Free(&sha);
-
-    siglen = (word32)wc_ecc_sig_size(&user_ecc);
-    ret = wc_ecc_sign_hash(digest, HASH_SZ, sigbuf, &siglen, &rng, &user_ecc);
-    if (ret != 0)
-        goto ga_cleanup;
+    /* WebAuthn signs authData || clientDataHash. Each algorithm applies its
+     * own hashing inside cred_alg_sign(): ECDSA pre-hashes, EdDSA and ML-DSA
+     * take the message directly, so the concatenation is passed whole.
+     */
+    if ((uint32_t)authDataLen + params.cdh_len > sizeof(signed_msg)) {
+        ret = -1; goto ga_cleanup;
+    }
+    memcpy(signed_msg, authData, authDataLen);
+    memcpy(signed_msg + authDataLen, params.clientDataHash, params.cdh_len);
+    siglen = sizeof(sigbuf);
+    if (cred_alg_sign(&user_key, signed_msg,
+                      (uint16_t)(authDataLen + params.cdh_len),
+                      sigbuf, &siglen, &rng) != 0) {
+        ret = -1; goto ga_cleanup;
+    }
 
     device_counter_inc();
 
@@ -1529,8 +1614,7 @@ static int ctap2_get_assertion(const uint8_t *payload, uint16_t payload_len,
 
 ga_cleanup:
     wc_FreeRng(&rng);
-    wc_ecc_free(&user_ecc);
-    ForceZero(private, sizeof(private));
+    cred_key_free(&user_key);
     if (ret != 0) {
         reply[0] = (ret > 0) ? (uint8_t)ret : CTAP2_ERR_NO_CREDENTIALS;
         *reply_len = 1;

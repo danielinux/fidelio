@@ -73,8 +73,14 @@ static void factory_reset_startup_check(void)
 
 void system_boot(void)
 {
-    /* Setting system clock */
-    set_sys_clock_48mhz();
+    /* 125 MHz rather than 48. The USB PLL is independent of the system
+     * clock, so this costs only a little power, and it is what brings every
+     * offered signature algorithm inside the latency budget: measured on
+     * RP2040, derive+sign worst case goes from 1138 ms to 513 ms for
+     * ML-DSA-87 and from 302 ms to 116 ms for ES256. See
+     * doc/benchmark-rp2040-125mhz.txt.
+     */
+    set_sys_clock_khz(125000, true);
 
     /* Setting GPIOs for Button first, so we can gate startup on long-press */
     presence_button_init();
