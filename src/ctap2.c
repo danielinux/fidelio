@@ -721,6 +721,23 @@ static int parse_cose_pubkey(const uint8_t *buf, uint16_t len, uint8_t *qx, uint
     if (key.alg != 0 && key.alg != COSE_ALG_ECDH_ES_HKDF256 &&
         key.alg != COSE_ALG_ES256)
         goto out;
+    /* Validate the point before it is used for ECDH.
+     *
+     * This key comes straight off the wire from the platform, and neither
+     * wc_ecc_import_unsigned() nor wc_ecc_shared_secret() checks it here:
+     * WOLFSSL_VALIDATE_ECC_IMPORT is off by default, and the import-time
+     * order check is compiled out under WOLFSSL_SP_MATH, which this build
+     * sets. An unchecked point permits an invalid-curve attack, where a
+     * point on a weaker curve sharing the same field leaks the device's
+     * ECDH scalar through the resulting shared secret.
+     *
+     * wc_ecc_check_key() dispatches to sp_ecc_check_key_{256,384,521} in
+     * this configuration, which confirms the point satisfies the curve
+     * equation and is not the point at infinity. The NIST prime curves have
+     * cofactor 1, so no separate small-subgroup check is needed.
+     */
+    if (wc_ecc_check_key(&ecc) != 0)
+        goto out;
     if (wc_ecc_export_public_raw(&ecc, qx, &qxlen, qy, &qylen) != 0)
         goto out;
     if (qxlen != ECC_SZ || qylen != ECC_SZ)
@@ -1236,8 +1253,12 @@ static int ctap2_write_getinfo(uint8_t *reply, uint16_t reply_max, uint16_t *rep
     if (cbor_put_bool(&c, true) != 0) return -1;
     if (cbor_put_text(&c, "uv") != 0) return -1;
     if (cbor_put_bool(&c, false) != 0) return -1;
+    /* CTAP2: true means a PIN is currently set, false means supported but
+     * not yet configured. Reporting true unconditionally leaves a platform
+     * unable to tell whether it should prompt for PIN enrollment. */
+    pin_state_load();
     if (cbor_put_text(&c, "clientPin") != 0) return -1;
-    if (cbor_put_bool(&c, true) != 0) return -1;
+    if (cbor_put_bool(&c, pin_store.magic == FLASH_PIN_MAGIC) != 0) return -1;
 
     /* 5: maxMsgSize */
     if (wc_CBOR_EncodeUint(&c, 5) != 0) return -1;
