@@ -81,9 +81,6 @@ extern void ForceZero(void* mem, word32 len);
 #define FLASH_PIN_B_OFF    0x76000
 #define FLASH_PIN_MAGIC    0x50494E21 /* 'PIN!' */
 #define PIN_MAX_RETRIES    8
-#define FLASH_RK_OFF       0x74000
-#define FLASH_RK_MAGIC     0x524B2121 /* 'RK!!' */
-#define RK_MAX_SLOTS       8
 
 #define CTAP2_CMD_RESET           0x07
 
