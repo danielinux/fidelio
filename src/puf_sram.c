@@ -149,7 +149,8 @@ static void __not_in_flash_func(puf_write_checkpoint)(uint32_t magic,
                                                       const uint8_t *salt,
                                                       const uint8_t *helper)
 {
-    uint8_t page[PUF_PAGE_SPAN];
+    /* Static: 512 bytes is a quarter of the 2 KB core-0 stack. */
+    static uint8_t page[PUF_PAGE_SPAN];
     struct puf_checkpoint *cp = (struct puf_checkpoint *)page;
 
     memset(page, 0xFF, sizeof(page));
@@ -278,11 +279,10 @@ static uint32_t codeword_distance(const uint8_t *a, const uint8_t *b, int cw)
 
 static void __not_in_flash_func(diag_log_save)(void)
 {
-    uint8_t page[FLASH_SECTOR_SIZE];
-    memset(page, 0xFF, sizeof(page));
-    memcpy(page, &diag_log, sizeof(diag_log));
+    /* No bounce buffer: a 4 KB automatic array would have overflowed the
+     * 2 KB stack outright. fidelio_flash_program() pads the final page. */
     fidelio_flash_erase(FLASH_DIAG_OFF, FLASH_SECTOR_SIZE);
-    fidelio_flash_program(FLASH_DIAG_OFF, page, sizeof(page));
+    fidelio_flash_program(FLASH_DIAG_OFF, &diag_log, sizeof(diag_log));
 }
 
 /* Bring-up diagnostic. Reconstruction fails if any single 127-bit codeword

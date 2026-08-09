@@ -62,6 +62,13 @@
 #define CRED_ALG_MLDSA65    6
 #define CRED_ALG_MLDSA87    7
 
+/* Credential ID: alg(1) || nonce(32) || tag(32). Defined here because both
+ * the CTAP2 layer and the discoverable-credential store need the size.
+ */
+#define CRED_ID_NONCE_SZ  32
+#define CRED_ID_TAG_SZ    32
+#define CRED_ID_LEN_MAX   (1 + CRED_ID_NONCE_SZ + CRED_ID_TAG_SZ)
+
 /* Largest public key and signature across the enabled set, used to size the
  * CTAP2 response buffers. ML-DSA-87: 2592-byte key, 4627-byte signature.
  */

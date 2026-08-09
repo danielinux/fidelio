@@ -22,6 +22,7 @@
 #include "fdo.h"
 #include "indicator.h"
 #include "cred_alg.h"
+#include "cred_store.h"
 #include "wolfssl/wolfcrypt/puf.h"
 #include "wolfcose/wolfcose.h"
 
@@ -39,6 +40,7 @@ extern void ForceZero(void* mem, word32 len);
 #define CTAP2_ERR_PIN_BLOCKED        0x34
 #define CTAP2_ERR_PIN_NOT_SET        0x35
 #define CTAP2_ERR_PIN_AUTH_INVALID   0x33
+#define CTAP2_ERR_KEY_STORE_FULL     0x28
 
 #define CTAP2_PIN_PROTOCOL_SUPPORTED 1
 #define CTAP2_CMD_MAKE_CREDENTIAL    0x01
@@ -84,7 +86,7 @@ extern void ForceZero(void* mem, word32 len);
  * one on offer. It is also checked before any key derivation runs, so a
  * bogus ID costs a HMAC rather than an ML-DSA keygen.
  */
-#define CRED_ID_LEN (1 + NONCE_SZ + HASH_SZ)
+#define CRED_ID_LEN CRED_ID_LEN_MAX
 
 
 /* CBOR (RFC 8949) encoding and decoding is provided by wolfCOSE. The thin
@@ -239,68 +241,6 @@ static uint8_t pin_agree_qy[ECC_SZ];
 static bool pin_agree_valid = false;
 static bool pin_agree_consumed = true;
 
-struct rk_slot {
-    uint8_t magic[4];
-    uint8_t rpIdHash[HASH_SZ];
-    uint8_t user_handle[32];
-    uint8_t cred_id[CRED_ID_LEN];
-    uint16_t cred_id_len;
-    uint8_t pub_qx[ECC_SZ];
-    uint8_t pub_qy[ECC_SZ];
-    uint32_t counter;
-};
-
-static struct rk_slot rk_slots[RK_MAX_SLOTS];
-static bool rk_loaded = false;
-
-static void rk_load(void)
-{
-    if (rk_loaded)
-        return;
-    const struct rk_slot *flash_rk = (const struct rk_slot *)(XIP_BASE + FLASH_RK_OFF);
-    memcpy(rk_slots, flash_rk, sizeof(rk_slots));
-    rk_loaded = true;
-}
-
-static void rk_save(void)
-{
-    fidelio_flash_erase(FLASH_RK_OFF, FLASH_SECTOR_SIZE);
-    fidelio_flash_program(FLASH_RK_OFF, (const uint8_t *)rk_slots, sizeof(rk_slots));
-}
-
-static int rk_find_free(void)
-{
-    for (int i = 0; i < RK_MAX_SLOTS; i++) {
-        if (memcmp(rk_slots[i].magic, (uint8_t[4]){0}, 4) == 0)
-            return i;
-    }
-    return -1;
-}
-
-static int rk_find_match(const uint8_t *rpIdHash, const uint8_t *cred_id, uint16_t cred_len)
-{
-    for (int i = 0; i < RK_MAX_SLOTS; i++) {
-        if (memcmp(rk_slots[i].magic, (uint8_t[4]){ 'R','K','!','!' }, 4) != 0)
-            continue;
-        if (rk_slots[i].cred_id_len == cred_len &&
-            memcmp(rk_slots[i].rpIdHash, rpIdHash, HASH_SZ) == 0 &&
-            memcmp(rk_slots[i].cred_id, cred_id, cred_len) == 0)
-            return i;
-    }
-    return -1;
-}
-
-static int rk_find_first_for_rp(const uint8_t *rpIdHash)
-{
-    for (int i = 0; i < RK_MAX_SLOTS; i++) {
-        if (memcmp(rk_slots[i].magic, (uint8_t[4]){ 'R','K','!','!' }, 4) != 0)
-            continue;
-        if (memcmp(rk_slots[i].rpIdHash, rpIdHash, HASH_SZ) == 0)
-            return i;
-    }
-    return -1;
-}
-
 static void pin_state_reset(void)
 {
     memset(&pin_store, 0, sizeof(pin_store));
@@ -311,13 +251,6 @@ static void pin_state_reset(void)
     pin_agree_valid = false;
     pin_agree_consumed = true;
     fidelio_flash_erase(FLASH_PIN_OFF, FLASH_SECTOR_SIZE);
-}
-
-static void rk_reset(void)
-{
-    memset(rk_slots, 0, sizeof(rk_slots));
-    rk_loaded = false;
-    fidelio_flash_erase(FLASH_RK_OFF, FLASH_SECTOR_SIZE);
 }
 
 static void pin_state_load(void)
@@ -760,6 +693,8 @@ struct mc_params {
     int pin_protocol;
     const uint8_t *user_handle;
     uint32_t user_handle_len;
+    const uint8_t *user_name;
+    uint32_t user_name_len;
     bool rk;
 };
 
@@ -866,6 +801,28 @@ static int parse_makecred(const uint8_t *buf, uint16_t len, struct mc_params *ou
                         return -1;
                     if (tlen == 2 && t[0] == 'i' && t[1] == 'd') {
                         if (cbor_read_text(&c, &out->rp_id, &out->rp_id_len) != 0)
+                            return -1;
+                    } else if (wc_CBOR_Skip(&c) != WOLFCOSE_SUCCESS) {
+                        return -1;
+                    }
+                }
+                break;
+            }
+            case 3: { /* user */
+                uint32_t mitems;
+                if (cbor_read_map(&c, &mitems) != 0)
+                    return -1;
+                for (uint32_t j = 0; j < mitems; j++) {
+                    const uint8_t *t; uint32_t tlen;
+                    if (cbor_read_text(&c, &t, &tlen) != 0)
+                        return -1;
+                    if (tlen == 2 && memcmp(t, "id", 2) == 0) {
+                        if (cbor_read_bytes(&c, &out->user_handle,
+                                            &out->user_handle_len) != 0)
+                            return -1;
+                    } else if (tlen == 4 && memcmp(t, "name", 4) == 0) {
+                        if (cbor_read_text(&c, &out->user_name,
+                                           &out->user_name_len) != 0)
                             return -1;
                     } else if (wc_CBOR_Skip(&c) != WOLFCOSE_SUCCESS) {
                         return -1;
@@ -1221,7 +1178,7 @@ static int ctap2_write_getinfo(uint8_t *reply, uint16_t reply_max, uint16_t *rep
     if (wc_CBOR_EncodeUint(&c, 4) != 0) return -1;
     if (wc_CBOR_EncodeMapStart(&c, 4) != 0) return -1;
     if (cbor_put_text(&c, "rk") != 0) return -1;
-    if (cbor_put_bool(&c, false) != 0) return -1;
+    if (cbor_put_bool(&c, true) != 0) return -1;
     if (cbor_put_text(&c, "up") != 0) return -1;
     if (cbor_put_bool(&c, true) != 0) return -1;
     if (cbor_put_text(&c, "uv") != 0) return -1;
@@ -1365,19 +1322,32 @@ static int ctap2_make_credential(const uint8_t *payload, uint16_t payload_len,
         ret = -1; goto cleanup;
     }
 
-    rk_load();
     if (params.rk) {
-        int slot = rk_find_free();
-        if (slot >= 0) {
-            memcpy(rk_slots[slot].magic, "RK!!", 4);
-            memcpy(rk_slots[slot].rpIdHash, rpIdHash, HASH_SZ);
-            rk_slots[slot].cred_id_len = credIdLen;
-            memcpy(rk_slots[slot].cred_id, credId, credIdLen);
-            rk_slots[slot].counter = 0;
-            if (params.user_handle && params.user_handle_len <= sizeof(rk_slots[slot].user_handle))
-                memcpy(rk_slots[slot].user_handle, params.user_handle, params.user_handle_len);
-            rk_save();
+        /* Discoverable credential: the relying party will later ask for it
+         * without supplying a credential ID, so the mapping has to be kept.
+         * It goes into the sealed vault, never plaintext flash. */
+        struct cred_record rec;
+        memset(&rec, 0, sizeof(rec));
+        memcpy(rec.rp_id_hash, rpIdHash, HASH_SZ);
+        memcpy(rec.cred_id, credId, credIdLen);
+        rec.cred_id_len = (uint8_t)credIdLen;
+        if (params.user_handle && params.user_handle_len > 0 &&
+            params.user_handle_len <= sizeof(rec.user_id)) {
+            memcpy(rec.user_id, params.user_handle, params.user_handle_len);
+            rec.user_id_len = (uint8_t)params.user_handle_len;
         }
+        if (params.user_name && params.user_name_len > 0) {
+            uint32_t n = params.user_name_len;
+            if (n > CRED_STORE_NAME_MAX)
+                n = CRED_STORE_NAME_MAX;
+            memcpy(rec.user_name, params.user_name, n);
+            rec.user_name[n] = '\0';
+        }
+        if (cred_store_put(&rec) != 0) {
+            ForceZero(&rec, sizeof(rec));
+            ret = CTAP2_ERR_KEY_STORE_FULL; goto cleanup;
+        }
+        ForceZero(&rec, sizeof(rec));
     }
 
     if (wc_EccPrivateKeyDecode(cert_master_key_der, &inOutIdx, &cert_ecc, cert_master_key_der_len) != 0) {
@@ -1501,6 +1471,30 @@ static int ctap2_get_assertion(const uint8_t *payload, uint16_t payload_len,
     /* Walk allowList entries until a matching handle is found. */
     uint32_t allow_off = 0;
     bool found = false;
+    const struct cred_record *disc = NULL;
+    unsigned disc_count = 0;
+
+    /* No allowList: the relying party expects the authenticator to discover
+     * the credential itself. That is the whole point of a resident key, and
+     * the only case where Fidelio needs stored state. */
+    if (params.allow_rk || (params.allow_list_len == 0 && !params.cred_id)) {
+        disc_count = cred_store_count(rpIdHash);
+        disc = cred_store_get(rpIdHash, 0);
+        if (disc != NULL) {
+            if (cred_open(disc->cred_id, disc->cred_id_len, rpIdHash,
+                          &user_key, NULL) == 0) {
+                params.cred_id = disc->cred_id;
+                params.cred_id_len = disc->cred_id_len;
+                found = true;
+            }
+        }
+        if (!found) {
+            reply[0] = CTAP2_ERR_NO_CREDENTIALS;
+            *reply_len = 1;
+            return 0;
+        }
+    }
+    if (!found)
     do {
         const uint8_t *cid = params.cred_id;
         uint32_t cid_len = params.cred_id_len;
@@ -1689,7 +1683,9 @@ static int ctap2_get_assertion(const uint8_t *payload, uint16_t payload_len,
     WOLFCOSE_CBOR_CTX c;
     cbor_enc_init(&c, reply, reply_max, 1);
     reply[0] = CTAP2_ERR_SUCCESS;
-    if (wc_CBOR_EncodeMapStart(&c, 4) != 0) { ret = -1; goto ga_cleanup; }
+    /* A discoverable assertion additionally returns the user entity (4) so
+     * the relying party knows which account signed in. */
+    if (wc_CBOR_EncodeMapStart(&c, disc ? 5 : 4) != 0) { ret = -1; goto ga_cleanup; }
     if (wc_CBOR_EncodeUint(&c, 1) != 0) { ret = -1; goto ga_cleanup; }
     if (wc_CBOR_EncodeMapStart(&c, 2) != 0) { ret = -1; goto ga_cleanup; }
     if (cbor_put_text(&c, "id") != 0) { ret = -1; goto ga_cleanup; }
@@ -1701,8 +1697,18 @@ static int ctap2_get_assertion(const uint8_t *payload, uint16_t payload_len,
     if (wc_CBOR_EncodeBstr(&c, authData, authDataLen) != 0) { ret = -1; goto ga_cleanup; }
     if (wc_CBOR_EncodeUint(&c, 3) != 0) { ret = -1; goto ga_cleanup; }
     if (wc_CBOR_EncodeBstr(&c, sigbuf, (size_t)siglen) != 0) { ret = -1; goto ga_cleanup; }
+    if (disc != NULL) {
+        if (wc_CBOR_EncodeUint(&c, 4) != 0) { ret = -1; goto ga_cleanup; }
+        if (wc_CBOR_EncodeMapStart(&c, disc->user_name[0] ? 2 : 1) != 0) { ret = -1; goto ga_cleanup; }
+        if (cbor_put_text(&c, "id") != 0) { ret = -1; goto ga_cleanup; }
+        if (wc_CBOR_EncodeBstr(&c, disc->user_id, disc->user_id_len) != 0) { ret = -1; goto ga_cleanup; }
+        if (disc->user_name[0]) {
+            if (cbor_put_text(&c, "name") != 0) { ret = -1; goto ga_cleanup; }
+            if (cbor_put_text(&c, disc->user_name) != 0) { ret = -1; goto ga_cleanup; }
+        }
+    }
     if (wc_CBOR_EncodeUint(&c, 5) != 0) { ret = -1; goto ga_cleanup; }
-    if (wc_CBOR_EncodeUint(&c, 1) != 0) { ret = -1; goto ga_cleanup; }
+    if (wc_CBOR_EncodeUint(&c, disc ? disc_count : 1) != 0) { ret = -1; goto ga_cleanup; }
 
     *reply_len = (uint16_t)c.idx;
 
@@ -2013,7 +2019,7 @@ static int ctap2_client_pin(const uint8_t *payload, uint16_t payload_len,
 void ctap2_reset_state(void)
 {
     pin_state_reset();
-    rk_reset();
+    cred_store_wipe();
     fdo_reset();
 }
 
@@ -2035,7 +2041,7 @@ int ctap2_handle_cbor(const uint8_t *payload, uint16_t payload_len,
             return ctap2_client_pin(payload, payload_len, reply, reply_max, reply_len);
         case CTAP2_CMD_RESET:
             pin_state_reset();
-            rk_reset();
+            cred_store_wipe();
             fdo_init();
             reply[0] = CTAP2_ERR_SUCCESS;
             *reply_len = 1;

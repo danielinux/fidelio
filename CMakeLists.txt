@@ -59,6 +59,7 @@ target_sources(${PROJECT} PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/src/puf_sram.c
         ${CMAKE_CURRENT_SOURCE_DIR}/src/flash_rt.c
         ${CMAKE_CURRENT_SOURCE_DIR}/src/cred_alg.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/cred_store.c
         ${CMAKE_CURRENT_SOURCE_DIR}/src/alg_probe.c
         ${CMAKE_CURRENT_SOURCE_DIR}/src/cert.c
         ${CMAKE_CURRENT_SOURCE_DIR}/src/ctap2.c
@@ -84,6 +85,9 @@ target_sources(${PROJECT} PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/lib/wolfssl/wolfcrypt/src/coding.c
         ${CMAKE_CURRENT_SOURCE_DIR}/lib/wolfssl/wolfcrypt/src/random.c
         ${CMAKE_CURRENT_SOURCE_DIR}/lib/wolfssl/wolfcrypt/src/aes.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/lib/wolfssl/wolfcrypt/src/chacha.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/lib/wolfssl/wolfcrypt/src/poly1305.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/lib/wolfssl/wolfcrypt/src/chacha20_poly1305.c
         ${CMAKE_CURRENT_SOURCE_DIR}/lib/wolfssl/wolfcrypt/src/sha256.c
         ${CMAKE_CURRENT_SOURCE_DIR}/lib/wolfssl/wolfcrypt/src/sha512.c
         ${CMAKE_CURRENT_SOURCE_DIR}/lib/wolfssl/wolfcrypt/src/ge_low_mem.c
@@ -106,6 +110,11 @@ target_include_directories(${PROJECT} PUBLIC
         )
 
         target_compile_definitions( ${PROJECT} PUBLIC WOLFSSL_USER_SETTINGS)
+
+# The SDK defaults core 0 to a 2 KB stack, which is tight once ML-DSA and the
+# SP math are in play. SCRATCH_Y holds 4 KB and the bootrom's copy of the
+# second stage loader at its top has already run by the time main() does.
+target_compile_definitions(${PROJECT} PUBLIC PICO_STACK_SIZE=4096)
 
 # Measurement/feature hook: extra wolfSSL feature macros.
 if(FIDELIO_EXTRA_DEFS)

@@ -67,6 +67,20 @@
 #define WOLFSSL_SHAKE128
 #define WOLFSSL_SHAKE256
 
+/* ChaCha20-Poly1305 for the discoverable-credential vault.
+ *
+ * Chosen over AES-GCM because ARMv6-M has neither a carryless multiply nor a
+ * 32x32->64 multiply, which makes GHASH the slowest option available, and
+ * because ChaCha20 is pure add/rotate/xor with no lookup tables at all. The
+ * firmware executes from flash through the XIP cache, so a table-driven
+ * construction would carry a cache-timing surface on a device an attacker
+ * physically holds. Throughput is irrelevant here -- the vault is ~2 KB
+ * rewritten only on registration, where the flash erase dominates.
+ */
+#define HAVE_CHACHA
+#define HAVE_POLY1305
+#define HAVE_AEAD
+
 /* SRAM PUF root of trust: the device master secret is reconstructed at boot
  * instead of being stored in flash. See src/puf_sram.c.
  *
