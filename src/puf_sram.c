@@ -199,6 +199,91 @@ static int puf_make_salt(uint8_t *salt)
 #ifdef FIDELIO_PUF_DIAG
 #include <stdio.h>
 
+/* --- Bring-up diagnostic log ---------------------------------------------
+ *
+ * The measurement that decides whether the configured BCH profile is right
+ * for a given board is the per-codeword bit error rate: how far each boot's
+ * SRAM reading drifts from the one that was enrolled. Reconstruction fails
+ * when any single 127-bit codeword drifts by more than WC_PUF_BCH_T bits.
+ *
+ * Collecting that needs many power cycles, and a Pico has no console unless
+ * a UART adapter is wired up. So each run appends a record to a flash log and
+ * reports a verdict on the LED; the whole series is read out afterwards with
+ *
+ *   picotool save -r 0x101ff000 0x10200000 log.bin
+ *
+ * (hold BOOT while plugging in to get into BOOTSEL first).
+ */
+#define FLASH_DIAG_OFF   0x1FF000   /* last sector of a 2 MB part */
+#define FLASH_DIAG_ADDR  ((const uint8_t *)(XIP_BASE + FLASH_DIAG_OFF))
+#define DIAG_MAGIC       0x504C4732u /* 'PLG2' */
+#define DIAG_MAX_REC     100
+
+/* Per-codeword distances are recorded, not just the worst one. Whether the
+ * errors concentrate in the same few blocks every boot or wander decides
+ * whether a marginal board is a placement problem (move the region) or a
+ * physics problem (accept the retry).
+ */
+struct puf_diag_rec {
+    uint16_t seq;
+    uint16_t weight;    /* bits set in this boot's response */
+    uint16_t dist;      /* total Hamming distance from the reference */
+    uint16_t max_cw;    /* worst single-codeword distance, of 127 */
+    uint16_t over_t;    /* codewords that exceeded WC_PUF_BCH_T */
+    uint8_t  recon_ok;  /* wc_PufReconstructEx() succeeded */
+    uint8_t  cp_state;  /* checkpoint magic seen: 0 none, 1 prov, 2 committed */
+    uint8_t  cw[WC_PUF_NUM_CODEWORDS]; /* distance per codeword */
+    uint32_t reserved;
+};
+
+struct puf_diag_log {
+    uint32_t magic;
+    uint16_t count;
+    uint16_t bch_t;
+    uint16_t ncw;
+    uint16_t raw_bytes;
+    uint8_t  pad[20];
+    uint8_t  reference[WC_PUF_RAW_BYTES];
+    struct puf_diag_rec rec[DIAG_MAX_REC];
+};
+
+/* diag_log_save() copies this wholesale into a sector-sized stack buffer. */
+_Static_assert(sizeof(struct puf_diag_log) <= FLASH_SECTOR_SIZE,
+               "diagnostic log does not fit in one flash sector");
+
+static struct puf_diag_log diag_log;
+
+static uint32_t popcount8(uint8_t v)
+{
+    uint32_t n = 0;
+    while (v) { n += (v & 1u); v >>= 1; }
+    return n;
+}
+
+/* Distance over the 127 bits codeword `cw` actually uses. Bits are packed
+ * MSB-first, so bit 127 is the low bit of the last byte and is not part of
+ * the codeword.
+ */
+static uint32_t codeword_distance(const uint8_t *a, const uint8_t *b, int cw)
+{
+    const uint8_t *pa = a + (cw * 16);
+    const uint8_t *pb = b + (cw * 16);
+    uint32_t d = 0;
+    for (int i = 0; i < 15; i++)
+        d += popcount8((uint8_t)(pa[i] ^ pb[i]));
+    d += popcount8((uint8_t)((pa[15] ^ pb[15]) & 0xFEu));
+    return d;
+}
+
+static void __not_in_flash_func(diag_log_save)(void)
+{
+    uint8_t page[FLASH_SECTOR_SIZE];
+    memset(page, 0xFF, sizeof(page));
+    memcpy(page, &diag_log, sizeof(diag_log));
+    flash_range_erase(FLASH_DIAG_OFF, FLASH_SECTOR_SIZE);
+    flash_range_program(FLASH_DIAG_OFF, page, sizeof(page));
+}
+
 /* Bring-up diagnostic. Reconstruction fails if any single 127-bit codeword
  * carries more than WC_PUF_BCH_T flipped bits, and the margin shrinks at
  * temperature extremes and varies between chips, so a board should be
@@ -208,20 +293,107 @@ static int puf_make_salt(uint8_t *salt)
  * across the temperature range the key will see, and confirm reconstruction
  * succeeds every time.
  */
+/* Show the verdict and stay lit, so the operator can just unplug and replug.
+ * Colours are chosen to be readable at a glance on the RGB boards:
+ *   blue   first run, reference captured
+ *   green  comfortable margin
+ *   amber  inside the correction limit but close to it
+ *   red    would have failed to reconstruct
+ *   white  log full
+ */
+static void diag_verdict(uint32_t max_cw, bool first)
+{
+    if (first)
+        indicator_set(0, 0, 0x30);
+    else if (max_cw > WC_PUF_BCH_T)
+        indicator_set(0x30, 0, 0);
+    else if (max_cw * 3 >= (uint32_t)WC_PUF_BCH_T * 2)
+        indicator_set(0x30, 0x18, 0);
+    else
+        indicator_set(0, 0x30, 0);
+    while (1) { tight_loop_contents(); }
+}
+
 void puf_diag_report(void)
 {
     const struct puf_checkpoint *cp = (const struct puf_checkpoint *)FLASH_PUF_ADDR;
+    const struct puf_diag_log *stored = (const struct puf_diag_log *)FLASH_DIAG_ADDR;
     wc_PufCtx ctx;
+    struct puf_diag_rec rec;
     int m, n, k, t, ncw;
     uint32_t i;
+    uint32_t weight = 0, dist = 0, max_cw = 0, over_t = 0;
+    bool first = false;
 
     stdio_init_all();
-    sleep_ms(3000); /* let the host attach to the UART */
+    sleep_ms(200);
 
     puf_sram_snapshot();
 
+    /* ---- measure ---- */
+    for (i = 0; i < WC_PUF_RAW_BYTES; i++)
+        weight += popcount8(puf_raw[i]);
+
+    memcpy(&diag_log, stored, sizeof(diag_log));
+    if (diag_log.magic != DIAG_MAGIC || diag_log.raw_bytes != WC_PUF_RAW_BYTES ||
+        diag_log.bch_t != WC_PUF_BCH_T || diag_log.ncw != WC_PUF_NUM_CODEWORDS) {
+        /* First run, or a log from a different build: start over and take
+         * this boot's reading as the reference everything is compared to.
+         */
+        memset(&diag_log, 0, sizeof(diag_log));
+        diag_log.magic = DIAG_MAGIC;
+        diag_log.bch_t = WC_PUF_BCH_T;
+        diag_log.ncw = WC_PUF_NUM_CODEWORDS;
+        diag_log.raw_bytes = WC_PUF_RAW_BYTES;
+        memcpy(diag_log.reference, puf_raw, WC_PUF_RAW_BYTES);
+        first = true;
+        memset(&rec, 0, sizeof(rec));
+    } else {
+        memset(&rec, 0, sizeof(rec));
+        for (i = 0; i < WC_PUF_RAW_BYTES; i++)
+            dist += popcount8((uint8_t)(puf_raw[i] ^ diag_log.reference[i]));
+        for (i = 0; i < WC_PUF_NUM_CODEWORDS; i++) {
+            uint32_t d = codeword_distance(puf_raw, diag_log.reference, (int)i);
+            rec.cw[i] = (uint8_t)d;
+            if (d > max_cw)
+                max_cw = d;
+            if (d > (uint32_t)WC_PUF_BCH_T)
+                over_t++;
+        }
+    }
+
+    /* ---- end-to-end check against the real checkpoint, if enrolled ---- */
+    if (cp->magic == PUF_MAGIC_PROVISIONAL)
+        rec.cp_state = 1;
+    else if (cp->magic == PUF_MAGIC_COMMITTED)
+        rec.cp_state = 2;
+
+    if (rec.cp_state != 0 && wc_PufInit(&ctx) == 0 &&
+        wc_PufReadSram(&ctx, puf_raw, sizeof(puf_raw)) == 0) {
+        rec.recon_ok = (wc_PufReconstructEx(&ctx, cp->helper,
+                                            WC_PUF_HELPER_BYTES,
+                                            cp->profileId) == 0) ? 1 : 0;
+        wc_PufZeroize(&ctx);
+    }
+
+    /* ---- append and persist ---- */
+    if (diag_log.count < DIAG_MAX_REC) {
+        rec.seq = diag_log.count;
+        rec.weight = (uint16_t)weight;
+        rec.dist = (uint16_t)dist;
+        rec.max_cw = (uint16_t)max_cw;
+        rec.over_t = (uint16_t)over_t;
+        diag_log.rec[diag_log.count] = rec;
+        diag_log.count++;
+        diag_log_save();
+    } else {
+        indicator_set(0x30, 0x30, 0x30);
+        while (1) { tight_loop_contents(); }
+    }
+
+    /* ---- also print, in case a UART adapter is attached to GP0/GP1 ---- */
     wc_PufGetParams(&m, &n, &k, &t, &ncw);
-    printf("\n=== fidelio SRAM PUF diagnostic ===\n");
+    printf("\n=== fidelio SRAM PUF diagnostic, run %u ===\n", diag_log.count - 1);
     printf("profile  : BCH(%d,%d,t=%d) over GF(2^%d), %d codewords\n",
            n, k, t, m, ncw);
     printf("profileId: app %08lx / lib %08lx%s\n",
@@ -231,62 +403,25 @@ void puf_diag_report(void)
     printf("region   : %p .. %p (%u bytes needed)\n",
            (void *)__puf_sram_start__, (void *)__puf_sram_end__,
            (unsigned)WC_PUF_RAW_BYTES);
-    printf("checkpoint magic %08lx profileId %08lx\n",
-           (unsigned long)cp->magic, (unsigned long)cp->profileId);
-
-    printf("raw response:\n");
-    for (i = 0; i < WC_PUF_RAW_BYTES; i++) {
-        printf("%02x", puf_raw[i]);
-        if ((i % 32) == 31)
-            printf("\n");
-    }
-
-    /* Hamming weight is a coarse health check: a healthy SRAM PUF sits near
-     * 50%. A response that is nearly all zeros or all ones means the region
-     * was initialised by something and carries no entropy.
-     */
-    {
-        uint32_t ones = 0;
-        for (i = 0; i < WC_PUF_RAW_BYTES; i++) {
-            uint8_t v = puf_raw[i];
-            while (v) { ones += (v & 1u); v >>= 1; }
-        }
-        printf("hamming weight: %lu/%u bits (%lu%%)\n", (unsigned long)ones,
-               (unsigned)WC_PUF_RAW_BITS,
-               (unsigned long)(ones * 100u / WC_PUF_RAW_BITS));
-    }
-
-    if (cp->magic != PUF_MAGIC_COMMITTED && cp->magic != PUF_MAGIC_PROVISIONAL) {
-        printf("no enrollment yet: boot once without FIDELIO_PUF_DIAG to enroll,\n"
-               "then power-cycle and re-run this to measure drift.\n");
-        while (1) { tight_loop_contents(); }
-    }
-
-    if (wc_PufInit(&ctx) != 0 ||
-        wc_PufReadSram(&ctx, puf_raw, sizeof(puf_raw)) != 0) {
-        printf("puf init failed\n");
-        while (1) { tight_loop_contents(); }
-    }
-
-    if (wc_PufReconstructEx(&ctx, cp->helper, WC_PUF_HELPER_BYTES,
-                            cp->profileId) != 0) {
-        printf("RECONSTRUCT FAILED: at least one codeword exceeded t=%d.\n"
-               "Normal firmware would ask for a power cycle and retry.\n"
-               "If this repeats, the board is too noisy for this profile.\n", t);
+    printf("weight   : %lu/%u bits (%lu%%)\n", (unsigned long)weight,
+           (unsigned)WC_PUF_RAW_BITS,
+           (unsigned long)(weight * 100u / WC_PUF_RAW_BITS));
+    if (first) {
+        printf("reference captured; power-cycle to start measuring drift\n");
     } else {
-        uint8_t id[WC_PUF_ID_SZ];
-        printf("reconstruct OK\n");
-        if (wc_PufGetIdentity(&ctx, id, sizeof(id)) == 0) {
-            printf("identity: ");
-            for (i = 0; i < WC_PUF_ID_SZ; i++)
-                printf("%02x", id[i]);
-            printf("\n(identical on every boot of the same device)\n");
-        }
+        printf("drift    : %lu/%u bits (%lu.%02lu%% BER)\n", (unsigned long)dist,
+               (unsigned)WC_PUF_RAW_BITS,
+               (unsigned long)(dist * 100u / WC_PUF_RAW_BITS),
+               (unsigned long)((dist * 10000u / WC_PUF_RAW_BITS) % 100u));
+        printf("worst codeword: %lu errors (t=%d), %lu codewords over t\n",
+               (unsigned long)max_cw, t, (unsigned long)over_t);
     }
-    wc_PufZeroize(&ctx);
+    printf("checkpoint magic %08lx, reconstruct %s\n",
+           (unsigned long)cp->magic, rec.recon_ok ? "OK" : "n/a or FAILED");
 
-    while (1) { tight_loop_contents(); }
+    diag_verdict(max_cw, first);
 }
+
 #endif /* FIDELIO_PUF_DIAG */
 
 int puf_provision(void)

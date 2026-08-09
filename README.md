@@ -208,13 +208,20 @@ When Fidelio cannot proceed it blinks the LED a fixed number of times, pauses, a
 | 2 | Reconstruction failed | Unplug and replug to retry |
 | 3 | Build or memory-map fault | Firmware problem; see below |
 
-**Code 2 is usually transient.** It means this boot's reading of the SRAM drifted further from
-the enrolled one than the error-correcting code could repair. The next power-on is an
-independent draw and will very likely succeed. Fidelio deliberately does not retry by itself: a
-warm reset would replay the identical SRAM contents and fail identically, and re-enrolling would
-"fix" the boot by silently minting a different master key and invalidating every credential. If
-code 2 repeats across several power cycles, the board is too noisy for the configured profile —
-run the diagnostic below.
+**Code 2 is transient and expected occasionally.** It means this boot's reading of the SRAM
+drifted further from the enrolled one than the error-correcting code could repair. Unplug, wait
+a few seconds, and plug back in; the next power-on is an independent draw.
+
+On a measured Waveshare RP2040-Zero this happens on roughly **one boot in seven**, so three
+consecutive failures is around a 1-in-300 event. That is a deliberate trade: correcting more
+errors means extracting fewer bits, and a key that occasionally asks for a replug is better than
+one whose master key has a thin entropy margin. See "Qualifying a board" for the measurements
+and how to repeat them.
+
+Fidelio deliberately does not retry by itself. A warm reset would replay the identical SRAM
+contents and fail identically, so only a real power cycle helps. It also never re-enrolls
+automatically: that would "fix" the boot by silently minting a different master key and
+invalidating every credential.
 
 **Code 3 is not retryable.** It means the firmware and the wolfSSL build disagree about the PUF
 profile, or something in the image was linked on top of the reserved SRAM region.
@@ -222,24 +229,54 @@ profile, or something in the image was linked on top of the reserved SRAM region
 ### Qualifying a board
 
 The fuzzy extractor corrects at most 13 flipped bits per 127-bit codeword, and reconstruction
-fails if any one of the 16 codewords exceeds that. A typical SRAM PUF sits comfortably inside
-the limit, but the margin narrows at temperature extremes and varies between chips. Before
-registering credentials against a new board, check it:
+fails if any one of the 16 codewords exceeds that. The margin narrows at temperature extremes
+and varies between chips, so a new board is worth measuring before credentials are registered
+against it.
 
 ```
 cmake -B build-diag -DPICO_COPY_TO_RAM=1 -DFAMILY=rp2040 \
-      -DPICO_SDK_PATH=/path/to/fidelio/pico-sdk -DFIDELIO_PUF_DIAG=ON
+      -DPICO_SDK_PATH=/path/to/fidelio/pico-sdk -DBOARD=rp2040-zero -DFIDELIO_PUF_DIAG=ON
 cmake --build build-diag
 cp build-diag/fidelio.uf2 /path/to/RPI-RP2
 ```
 
-The diagnostic prints a report on UART0 (GP0/GP1, 115200 8N1) instead of acting as an
-authenticator. Power-cycle it a dozen or so times, across the temperature range the key will
-actually see, and check that reconstruction succeeds every time and that the Hamming weight of
-the raw response stays near 50%. A response that is nearly all zeros or all ones means the
-region carries no entropy on that board.
+The diagnostic replaces the authenticator. On each boot it compares the SRAM response against a
+reference captured on its first run, appends the result to a log in the last flash sector, and
+shows a verdict on the LED: **blue** reference captured, **green** comfortable, **amber** inside
+the correction limit, **red** would have failed. It also prints a report on UART0 (GP0/GP1,
+115200 8N1) if an adapter is attached.
 
-**Do not leave a diagnostic build flashed** — it is not an authenticator.
+Power-cycle it a dozen or more times, leaving it unplugged a few seconds each time, then read
+the log back over USB in BOOTSEL:
+
+```
+picotool save -r 0x101ff000 0x10200000 puflog.bin
+```
+
+The log holds a per-codeword error count for every boot, so it shows not just how often a board
+would fail but whether the errors concentrate in one block or move around.
+
+Two things to watch for. The Hamming weight of the response should sit near 50%; far from that
+means the region was written by something and carries no entropy. And **the reference must come
+from a cold boot** — capture it after a real power cycle, not from the reboot that follows
+flashing, because the BOOTSEL path disturbs part of the region and every later boot will then
+disagree with it.
+
+Measured on a Waveshare RP2040-Zero, 33 cold boots across two campaigns:
+
+| | |
+|---|---|
+| Bit error rate vs the enrolled reading | 4.9% – 7.0%, mean 5.9% |
+| Worst codeword per boot | 10 – 15 errors of 127 |
+| Reconstruction failures at t=13 | 5 of 33 (~15%) |
+| Same data at t=10 (wolfCrypt's default) | 33 of 33 |
+
+The errors did not concentrate: the worst block varied from boot to boot, and dropping the
+worst-behaving one only moved failures from 2/18 to 1/18. This is the noise floor of the SRAM,
+not a placement problem, which is why the answer is a retry path rather than a bigger `t`.
+
+**Do not leave a diagnostic build flashed** — it is not an authenticator, and it writes to the
+last flash sector.
 
 ### Set the FIDO2 PIN
 
