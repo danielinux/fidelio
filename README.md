@@ -1,401 +1,298 @@
 # Fidelio
 
-## Turn a rp2040 into a personal authentication key
+Fidelio turns a Raspberry Pi RP2040 board into a personal USB security key. It
+supports FIDO2/WebAuthn, discoverable credentials (passkeys), and legacy
+CTAP1/U2F, using wolfCrypt for cryptography and wolfCOSE for CBOR/COSE.
 
-Universal FIDO2/U2F key using Raspberry Pi Pico (rp2040) and wolfCrypt. Works with
-any raspberry-pi pico device with only one component added (a pushbutton). Other
-rp2040 boards are selectable at build time; see [Supported boards](#supported-boards).
+You need an RP2040 board and one normally-open push-button. No secure element
+or other external component is required.
 
-### Goals and security model
+## What it supports
 
-Fidelio implements a FIDO2 authenticator (CTAP2/WebAuthn) with CTAP1/U2F
-compatibility, generally used as second factor in 2FA services, or in some
-specific cases for password-less authentication.
+- CTAP2/FIDO2 and WebAuthn, with CTAP1/U2F compatibility
+- Physical user presence through a push-button
+- FIDO2 PINs and PIN-protected operations
+- Up to 16 discoverable credentials, with one account per relying party
+- Unlimited non-discoverable credentials
+- The WebAuthn `hmac-secret` extension
+- ES256, Ed25519, ES384, ES512, ML-DSA-44, ML-DSA-65, and ML-DSA-87
+- Raspberry Pi Pico and Waveshare RP2040-Zero boards
+- A master secret reconstructed from the chip's SRAM power-on state instead of
+  stored in flash
 
-Associating a 2FA authentication service to a hardware key as second factor will
-require the user to provide the key to prove that they are still in possess of
-the hardware key that was initially registered.
+Fidelio chooses the strongest credential algorithm offered by the relying
+party. Most existing services will negotiate ES256; newer algorithms work only
+with clients and services that support them.
 
-The holder of the key can only prove the physical presence of the key during an
-authentication procedure. This is done by connecting it via USB and pushing a button.
+## Quick start
 
-Through this mechanism, the authenticator is given a proof that the
-request has been processed (signed) by the same key initially registered, so the
-user can be trusted as the authenticator assumes that the user is still holding
-the key.
+### 1. Prepare the hardware
 
-Two-factor authentication based on FIDO mechanisms is generally considered more secure than time-based
-OTP services, like mobile apps or other devices that require clock synchronization with the
-authenticating party.
+Connect a normally-open push-button between GND and the board's presence pin.
+The firmware cannot approve registration or authentication without it.
 
-The device creates a unique private key, which is then used to derive the keys for the
-authenticating services requesting a FIDO authentication. This means that Fidelio does
-not pose any storage limitation on the number of authentication services that can be
-registered, as the same key is derived again whenever needed and it's never stored on
-the device. CTAP1/U2F remains supported for legacy services; CTAP2/WebAuthn is the
-primary protocol.
+| `BOARD` value | Board | Presence button | Indicator |
+|---|---|---|---|
+| `pico` (default) | Raspberry Pi Pico | GPIO15 | On-board LED |
+| `rp2040-zero` | Waveshare RP2040-Zero v1.1 | GPIO29 | WS2812 on GPIO16 |
 
-The codebase is simple and rather small, allowing for an easy full audit of the security
-model and the related implementations.
+On a Raspberry Pi Pico, the button can be soldered directly in place:
 
+![Raspberry Pi Pico button wiring](doc/raspi_mod_button.png)
 
-### Security considerations
+### 2. Install the build tools
 
-The security of Fidelio depends entirely on the physical presence of the hardware. If Fidelio is lost
-or stolen, the second factor of all the registered services must be considered compromised, and the
-keys associated to the device should be revoked from all the associated services. This usually does
-not represent an important security risk in itself, as long as a first factor is in use (commonly,
-password authentication).
+The host needs:
 
-A rp2040 board running Fidelio will not store any credentials or traces that can be associated
-with any running server.
+- Git
+- CMake 3.31 or newer
+- an Arm GNU embedded toolchain (`arm-none-eabi-gcc`)
+- OpenSSL, `xxd`, and standard Unix tools
 
-**The master key is never stored.** It is reconstructed at every boot from the power-on state of
-a reserved block of SRAM — an SRAM PUF (Physically Unclonable Function) — using the wolfCrypt
-BCH(127,50,t=13) fuzzy extractor. What FLASH holds is only the *checkpoint*: non-secret helper
-data that corrects the bit errors in each boot's reading, plus a salt. Neither reveals the key.
-Dumping the FLASH of a Fidelio device therefore does not yield anything that can be used to
-impersonate it; the key exists only in RAM, only while the device is powered.
+`fido2-tools` is optional but useful for detecting the finished key and setting
+its PIN.
 
-The other information kept in FLASH is the counters tracking crypto operations, as mandated by
-the FIDO protocols, the FIDO2 PIN hash, and any resident credentials.
+### 3. Clone Fidelio and its dependencies
 
-Because the key is a property of the individual chip, a Fidelio image cannot be cloned onto
-another board to duplicate a key: flashing the same firmware elsewhere produces a different
-device. Concretely, copying the FLASH to a second RP2040 reproduces the helper data but not the
-SRAM response it corrects, so reconstruction yields a different master key and every credential
-derived from it differs. The credential private keys are themselves never stored anywhere --
-not in FLASH, not in the credential ID -- but re-derived per operation. There is therefore no
-artifact that can be copied to produce a second authenticator answering for the same
-credentials.
-
-That is also why **Fidelio reports a WebAuthn signature counter of zero.** The counter exists so
-a relying party can detect a cloned authenticator; since cloning is prevented by construction,
-there is nothing for it to detect. WebAuthn permits a constant zero -- synced passkey providers
-report zero on every assertion -- and it avoids the cross-relying-party correlation that a
-single device-wide counter leaks, without spending the per-credential storage that a private
-counter would need. The legacy CTAP1/U2F path keeps its own incrementing counter, because
-deployed U2F verifiers such as `pam_u2f` reject one that fails to advance.
-
-### Hardware requirements
-
-FIDO/U2F mandates the use of a single button to indicate that the user is
-actually present when the key is used. Without this button the authenticator
-will never assert user presence.
-
-For this purpose, Fidelio requires a normally-open push-button between GND and
-the presence pin of the board it is built for. The pin depends on the board;
-see the table below.
-
-On the Raspberry-pi pico board the button goes on GPIO15, and can normally be
-soldered in place:
-
-![Raspberry Pico soldering](doc/raspi_mod_button.png)
-
-Fidelio also uses an LED to signal that it is waiting for the button to be
-pressed, and to blink the halt codes described further down. Some boards have a
-plain LED, others a single WS2812 RGB LED; the firmware drives whichever the
-selected board declares.
-
-### Supported boards
-
-The board is chosen at configure time with `-DBOARD=`. The default is `pico`.
-
-| `BOARD` | Board | Presence button | Indicator | ADC entropy channels |
-|---|---|---|---|---|
-| `pico` (default) | Raspberry Pi Pico (RP2040) | GPIO15 | LED on `PICO_DEFAULT_LED_PIN` | 0-3 (GPIO26-29) |
-| `rp2040-zero` | Waveshare RP2040-Zero v1.1 | GPIO29 [*](#adcnote) | WS2812 RGB LED on GPIO16 | 0-2 (GPIO26-28) |
-
-<a name="adcnote">*</a> The RP2040-Zero exposes no free pin for the button other
-than GPIO29, which is also ADC channel 3. Fidelio seeds its DRBG partly from the
-noise on the floating ADC inputs, and initialising a pin for analog input takes
-it away from its digital function, so that board collects entropy from three
-channels instead of four. The button pin of every board is excluded from its
-ADC channel list for the same reason.
-
-An unrecognised `BOARD` value stops the configure step with an error rather
-than quietly building something else.
-
-#### Adding a board
-
-Two edits, no build-system surgery:
-
-1. Add a block to [src/pins.h](src/pins.h), guarded by a new
-   `FIDELIO_BOARD_<NAME>` macro, defining `PRESENCE_BUTTON`, either
-   `PRESENCE_LED` (plain LED) or `RGB_LED` (WS2812), and `FIDELIO_ADC_CHANNELS`
-   — the list of ADC channels that are left floating on that board. Channel N
-   is GPIO 26+N; leave out any channel whose GPIO you have used for something
-   else.
-2. Add a branch to the `if(BOARD STREQUAL ...)` chain in
-   [CMakeLists.txt](CMakeLists.txt) mapping the new `BOARD` value to that
-   macro, and list the value in the `set_property(CACHE BOARD PROPERTY
-   STRINGS ...)` call above it.
-
-
-### Build and flash:
-
-1. Clone this repository, create and populate build directory
-
-```
+```sh
 git clone https://github.com/danielinux/fidelio.git
 cd fidelio
-git submodule update --init --single-branch pico-sdk lib/wolfssl
-cd pico-sdk
-git submodule update --init --single-branch lib/tinyusb
-cd ..
-
+git submodule update --init --single-branch \
+    pico-sdk lib/wolfssl lib/wolfcose
+git -C pico-sdk submodule update --init --single-branch lib/tinyusb
 ```
 
-2. Create your own attestation certificate.
-This is required only once. The certificate generate will univocally identify your
-device.
+### 4. Create the attestation identity
 
-You may change/customize the details in the certificate by editing the `mkcert.sh`
-script.
+Run this once for each device identity:
 
-```
+```sh
 ./mkcert.sh
 ```
 
-3. Configure CMake (pass the full absolute path to pico-sdk):
+This generates an attestation certificate and embeds it in `src/cert.c`. Edit
+`attestation-cert.conf` first if you want to customize the certificate fields.
+Do not share `cert-master-key.pem`: it is the attestation private key. It is
+separate from the authenticator master secret described in [Security
+model](#security-model).
 
-```
-cmake -B build -DFAMILY=rp2040 -DPICO_SDK_PATH=/path/to/fidelio/pico-sdk
-```
+### 5. Build the firmware
 
-This builds for the Raspberry Pi Pico, which is the default. For a different
-board add `-DBOARD=`, for example:
+For a Raspberry Pi Pico:
 
-```
-cmake -B build -DFAMILY=rp2040 -DPICO_SDK_PATH=/path/to/fidelio/pico-sdk \
-      -DBOARD=rp2040-zero
-```
-
-See [Supported boards](#supported-boards) for the accepted values.
-
-4. Compile:
-
-```
+```sh
+cmake -S . -B build -DFAMILY=rp2040 -DPICO_SDK_PATH="$PWD/pico-sdk"
 cmake --build build
 ```
 
-5. Flash to the Pico (hold BOOTSEL when plugging in, then copy):
+For a Waveshare RP2040-Zero, add `-DBOARD=rp2040-zero` to the configure command.
+An unknown `BOARD` value is rejected rather than silently selecting another
+pinout.
 
-```
-cp build/fidelio.uf2 /path/to/RPI-RP2
-```
+### 6. Flash and enroll the device
 
+Hold BOOTSEL while connecting the board, then copy the UF2 file to the mounted
+`RPI-RP2` volume:
 
-### First run: enrolling the SRAM PUF
-
-The first time the device is plugged in, it enrolls its SRAM PUF. This takes two boots:
-
-1. **Enrollment.** The device measures the power-on state of its reserved SRAM block, computes
-   the helper data, writes it to FLASH as *provisional*, and then blinks halt code 1 (see
-   below) and stops. It does not enumerate over USB in this state.
-2. **Verification.** Unplug and plug the device back in. A real power cycle is required — a
-   reset would leave SRAM holding its previous contents and prove nothing. The device now
-   reconstructs the key from the helper data. If it matches, the checkpoint is marked
-   *committed* and the device starts normally. If it does not, the attempt is discarded and
-   enrollment starts over.
-
-Nothing is registered against the device until it reaches the committed state, so a board that
-fails verification costs nothing.
-
-From then on, every boot reconstructs the same master key, which is used for the entire lifetime
-of the device to derive the keys for individual FIDO services.
-
-Updating the Fidelio firmware to a newer version does not touch the checkpoint, so the key keeps
-working with services registered under the old firmware — **unless the update changes the PUF
-profile** (`WC_PUF_BCH_T` or `WC_PUF_NUM_CODEWORDS` in `src/user_settings.h`). Those values are
-recorded in the checkpoint and checked on every boot, so a mismatch is reported as halt code 3
-rather than silently deriving a different key.
-
-### Halt codes
-
-When Fidelio cannot proceed it blinks the LED a fixed number of times, pauses, and repeats:
-
-| Flashes | Meaning | What to do |
-|---|---|---|
-| 1 | Enrolled, awaiting verification | Unplug and replug (a reset is not enough) |
-| 2 | Reconstruction failed | Unplug and replug to retry |
-| 3 | Build or memory-map fault | Firmware problem; see below |
-
-**Code 2 is transient and expected occasionally.** It means this boot's reading of the SRAM
-drifted further from the enrolled one than the error-correcting code could repair. Unplug, wait
-a few seconds, and plug back in; the next power-on is an independent draw.
-
-On a measured Waveshare RP2040-Zero this happens on roughly **one boot in seven**, so three
-consecutive failures is around a 1-in-300 event. That is a deliberate trade: correcting more
-errors means extracting fewer bits, and a key that occasionally asks for a replug is better than
-one whose master key has a thin entropy margin. See "Qualifying a board" for the measurements
-and how to repeat them.
-
-Fidelio deliberately does not retry by itself. A warm reset would replay the identical SRAM
-contents and fail identically, so only a real power cycle helps. It also never re-enrolls
-automatically: that would "fix" the boot by silently minting a different master key and
-invalidating every credential.
-
-**Code 3 is not retryable.** It means the firmware and the wolfSSL build disagree about the PUF
-profile, or something in the image was linked on top of the reserved SRAM region.
-
-### Qualifying a board
-
-The fuzzy extractor corrects at most 13 flipped bits per 127-bit codeword, and reconstruction
-fails if any one of the 16 codewords exceeds that. The margin narrows at temperature extremes
-and varies between chips, so a new board is worth measuring before credentials are registered
-against it.
-
-```
-cmake -B build-diag -DFAMILY=rp2040 \
-      -DPICO_SDK_PATH=/path/to/fidelio/pico-sdk -DBOARD=rp2040-zero -DFIDELIO_PUF_DIAG=ON
-cmake --build build-diag
-cp build-diag/fidelio.uf2 /path/to/RPI-RP2
+```sh
+cp build/fidelio.uf2 /path/to/RPI-RP2/
 ```
 
-The diagnostic replaces the authenticator. On each boot it compares the SRAM response against a
-reference captured on its first run, appends the result to a log in the last flash sector, and
-shows a verdict on the LED: **blue** reference captured, **green** comfortable, **amber** inside
-the correction limit, **red** would have failed. It also prints a report on UART0 (GP0/GP1,
-115200 8N1) if an adapter is attached.
+The first enrollment takes two cold boots:
 
-Power-cycle it a dozen or more times, leaving it unplugged a few seconds each time, then read
-the log back over USB in BOOTSEL:
+1. The device records helper data for its SRAM PUF, blinks once repeatedly,
+   and does not appear as a USB security key.
+2. Unplug it completely, wait a few seconds, and plug it back in. A reset is
+   not enough. The device verifies that it can reconstruct the same secret,
+   commits the enrollment, and then starts normally.
 
+If it blinks twice, unplug it and try another cold boot. See [LED halt
+codes](#led-halt-codes) for details.
+
+### 7. Check the key and set a PIN
+
+On Linux, find the HID device and set a PIN with `fido2-tools`:
+
+```sh
+fido2-token -L
+fido2-token -S /dev/hidrawX
 ```
-picotool save -r 0x101ff000 0x10200000 puflog.bin
-```
 
-The log holds a per-codeword error count for every boot, so it shows not just how often a board
-would fail but whether the errors concentrate in one block or move around.
+Replace `/dev/hidrawX` with the path reported by `fido2-token -L`, and press the
+presence button when prompted. You can then register and log in at
+[WebAuthn.io](https://webauthn.io/) to test a complete WebAuthn flow.
 
-Two things to watch for. The Hamming weight of the response should sit near 50%; far from that
-means the region was written by something and carries no entropy. And **the reference must come
-from a cold boot** — capture it after a real power cycle, not from the reboot that follows
-flashing, because the BOOTSEL path disturbs part of the region and every later boot will then
-disagree with it.
+## Everyday use
 
-Measured on a Waveshare RP2040-Zero, 33 cold boots across two campaigns:
+When a browser or application asks for the security key, connect Fidelio and
+press its button while the indicator is lit. Enter the PIN if the client asks
+for user verification.
 
-| | |
-|---|---|
-| Bit error rate vs the enrolled reading | 4.9% – 7.0%, mean 5.9% |
-| Worst codeword per boot | 10 – 15 errors of 127 |
-| Reconstruction failures at t=13 | 5 of 33 (~15%) |
-| Same data at t=10 (wolfCrypt's default) | 33 of 33 |
-
-The errors did not concentrate: the worst block varied from boot to boot, and dropping the
-worst-behaving one only moved failures from 2/18 to 1/18. This is the noise floor of the SRAM,
-not a placement problem, which is why the answer is a retry path rather than a bigger `t`.
-
-**Do not leave a diagnostic build flashed** — it is not an authenticator, and it writes to the
-last flash sector.
+Keep another login or recovery method for every important account. Losing the
+device means losing access to its credentials; a person holding both the key
+and any required first factor may also be able to authenticate.
 
 ### Discoverable credentials (passkeys)
 
-Fidelio supports discoverable credentials, so a relying party can authenticate
-you without first telling the device which credential to use. These are the
-only credentials that require storage: an ordinary credential ID carries
-everything needed to re-derive its key, but a discoverable one has to be found
-from the site alone.
+Non-discoverable credentials need no device storage: the service returns the
+credential ID during authentication, and Fidelio uses it to derive the same
+private key again. Their number is therefore not limited by flash capacity.
 
-That record -- which services you hold accounts with, and under which user IDs
--- is exactly what a stolen key should not reveal. It is therefore sealed with
-ChaCha20-Poly1305 under a key derived from the device master key, using a fresh
-key on every update. Since the master key is itself never stored and exists
-only while the device is powered, a FLASH dump yields ciphertext and nothing
-else.
+Discoverable credentials must be found from the site name alone, so Fidelio
+stores them in a ChaCha20-Poly1305 sealed vault. The vault holds 16 sites.
+Fidelio is designed as a personal authenticator and stores one discoverable
+identity per relying party; creating another for the same site replaces the
+first. Use non-discoverable credentials if you need multiple accounts on one
+site.
 
-Fidelio is a personal authenticator holding a single identity, so it keeps **at
-most one discoverable credential per site**, and registering a second one for a
-site replaces the first. If you need two accounts on the same service, use
-non-discoverable credentials for them: those are unlimited, since the relying
-party names which credential it wants and nothing has to be stored.
-
-The vault holds 16 sites.
-
-### Set the FIDO2 PIN
-
-After flashing, set the authenticator PIN:
-
-```
-fido2-token -S /dev/hidrawX    # enter your chosen PIN when prompted
-```
-
-Replace `/dev/hidrawX` with the device path listed by `fido2-token -L`. Press the
-presence button when prompted during this flow.
+PIN state and the credential vault are each written to alternating flash
+sectors so an interrupted update does not leave a partially written live copy.
 
 ### Factory reset
 
-Hold the presence button while plugging the device in and keep it held for 10 seconds. The LED
-turns yellow while the state is wiped: the PUF checkpoint, the operation counters, the PIN and
-any resident credentials. The device then reboots into enrollment and needs the two-boot
-sequence described above.
+Hold the presence button while plugging in the device and keep it held for 10
+seconds. The indicator turns yellow while Fidelio erases the PUF checkpoint,
+PIN, counters, and discoverable credentials. It then returns to the two-boot
+enrollment sequence.
 
-This **permanently invalidates every credential** ever registered with the device. Re-enrollment
-draws a fresh salt, so the new master key is unrelated to the old one even though it comes from
-the same silicon. There is no way to recover the previous key — revoke the device at every
-service that still has it registered.
+This permanently invalidates every credential created by the device, including
+non-discoverable credentials. Revoke the old key at every service; its previous
+master secret cannot be recovered.
 
-### Testing
+## Security model
 
-#### Online services
+Fidelio derives a unique credential key for each relying party and registration.
+Credential private keys are never stored in flash or inside credential IDs;
+they are reconstructed only for the operation that needs them.
 
-To ensure that your device is correctly working, connect Fidelio to your PC and
-visit the WebAuthn.io demo: https://webauthn.io/
+The root of those derivations is a secret reconstructed at every cold boot from
+the power-on state of a reserved SRAM block. A wolfCrypt BCH(127,50,t=13) fuzzy
+extractor corrects normal variation. Flash contains only a random salt and
+non-secret helper data used for error correction, not the master secret.
 
-Use “Register” to create a credential (press the presence button when asked, and
-enter the PIN you set above), then “Login” to exercise getAssertion.
+Consequently, copying one device's flash to a different RP2040 does not clone
+the authenticator: the other chip has a different SRAM response and derives
+different keys. The master secret exists in RAM only while the enrolled device
+is powered.
 
-### Usage
+Fidelio reports a WebAuthn signature counter of zero. WebAuthn permits this,
+and a global counter would allow activity at different relying parties to be
+correlated. The legacy U2F path retains an incrementing counter because deployed
+U2F verifiers such as `pam_u2f` expect it.
 
-#### Service example: github second factor
+Flash still contains security-sensitive state: encrypted discoverable-credential
+metadata, the PIN verifier and retry state, U2F counters, and PUF helper data.
+A flash dump does not reveal credential private keys, but physical possession
+of a working enrolled device must still be treated as possession of the
+authentication factor.
 
-Go to your profile settings. Select "Password and authentication" from the Access menu.
+### Firmware updates
 
-Find the "Two factor authentication" configuration at the bottom of the page. Check the
-"Security Keys" option:
+Flashing a newer Fidelio UF2 leaves enrollment state intact, so existing
+credentials continue to work as long as the PUF profile is unchanged. Changing
+`WC_PUF_BCH_T` or `WC_PUF_NUM_CODEWORDS` in `src/user_settings.h` makes the
+stored profile incompatible and produces halt code 3 instead of silently
+deriving a different secret.
 
-![github.com 2FA config](doc/github_register_key.png)
+## LED halt codes
 
-The button "Register new security key" will associate the device running fidelio
-as a second factor to access your github account. Give it a unique name of your
-choice.
+If Fidelio cannot start, the indicator blinks a fixed number of times, pauses,
+and repeats:
 
-![github.com 2FA security key configured](doc/github_configured.png)
+| Flashes | Meaning | Action |
+|---|---|---|
+| 1 | Enrollment recorded; verification required | Unplug and reconnect; a reset is not enough |
+| 2 | SRAM PUF reconstruction failed on this boot | Unplug, wait a few seconds, and reconnect |
+| 3 | PUF profile or reserved-memory mismatch | Fix the firmware configuration or memory map |
 
-It is a good idea to configure more than one 2FA mechanism to your account to
-avoid the risk of being locked out of your account. This of course includes the
-possibility to use more than one fidelio hardware keys, stored in different places.
+Code 2 can occur occasionally because cold-boot SRAM varies. Fidelio does not
+retry with a warm reset, which would reuse the same SRAM contents, and it never
+automatically re-enrolls, which would silently replace the secret and invalidate
+all credentials.
 
-#### Local PAM services
+On one measured Waveshare RP2040-Zero, reconstruction failed on about one boot
+in seven. This is a board-specific measurement, not a guaranteed rate for every
+RP2040.
 
-To test on a linux machine install `libpam-u2f` and `pamu2fcfg`. Run
-`pamu2fcfg -u $USER > ~/.config/Yubico/u2f_keys` (create the directory if needed)
-and press the presence button when prompted. Add a line such as
-`auth sufficient pam_u2f.so authfile=/home/%u/.config/Yubico/u2f_keys cue`
-to the relevant file in `/etc/pam.d` (e.g. `sudo`, `login`) to allow U2F
-assertions as password-less auth or as a second factor; see `man pamu2fcfg`
-and `man pam_u2f` for options and multiple-key setups.
+## Board qualification diagnostic
 
-For CTAP2/FIDO2 flows install `fido2-tools` and `libpam-fido2`. Confirm detection
-with `fido2-token -L`, then create a resident PAM credential with
-`fido2-cred -M -h pam://$(hostname) -i $USER > ~/.fido2-cred`. Add
-`auth sufficient pam_fido2.so authfile=/home/%u/.fido2-cred rp_id=$(hostname)`
-to the same `/etc/pam.d` service to use the key for FIDO2 password-less login;
-see `man pam_fido2` for tuning user verification, PIN prompts, and per-service
-`rp_id` values (e.g. matching SSH `TrustedUserCAKeys` hostnames).
+Before trusting a new board design, build the PUF diagnostic instead of the
+authenticator:
 
-**Ensure you always keep a root console open when changing pam.d configuration, and
-test your changes properly after each change to avoid locking yourself out of
-your machine**
+```sh
+cmake -S . -B build-diag -DFAMILY=rp2040 \
+    -DPICO_SDK_PATH="$PWD/pico-sdk" \
+    -DBOARD=rp2040-zero -DFIDELIO_PUF_DIAG=ON
+cmake --build build-diag
+cp build-diag/fidelio.uf2 /path/to/RPI-RP2/
+```
 
-### License
+On its first cold boot the diagnostic captures a reference. On later cold
+boots it compares the SRAM response, appends per-codeword error counts to the
+last flash sector, shows blue for reference captured, green for comfortable,
+amber for within the correction limit, or red for a reconstruction failure,
+and prints details on UART0 (GPIO0/GPIO1, 115200 8N1).
 
-Fidelio is free software under the **GNU General Public License, version 3 or
-later**; the full text is in [LICENSE](LICENSE).
+Power-cycle the board at least a dozen times, waiting a few seconds between
+boots. With the board in BOOTSEL mode, read the log using `picotool`:
 
-It links wolfSSL and wolfCOSE, both of which are GPLv3, so the combined work is
-GPLv3. wolfSSL Inc. also offers those components under a commercial licence for
-proprietary use -- see `lib/wolfssl/LICENSING` -- which is the route to take if
-GPLv3 does not suit.
+```sh
+picotool save -r 0x101ff000 0x10200000 puflog.bin
+```
+
+The reference must come from a genuine cold boot, not the reboot immediately
+after flashing: the BOOTSEL path disturbs part of SRAM. A healthy response has
+a Hamming weight near 50%, and no 127-bit codeword should routinely exceed the
+13-bit correction limit.
+
+Measurements from one RP2040-Zero over 33 cold boots were:
+
+| Measurement | Result |
+|---|---|
+| Bit error rate against enrollment | 4.9%–7.0%, mean 5.9% |
+| Worst codeword per boot | 10–15 errors out of 127 bits |
+| Reconstruction failures at t=13 | 5 of 33 (about 15%) |
+
+Do not leave the diagnostic installed: it is not an authenticator and it writes
+to the final flash sector.
+
+## Additional build options
+
+| CMake option | Purpose |
+|---|---|
+| `-DBOARD=pico` | Select the board pinout (`pico` is the default) |
+| `-DFIDELIO_PUF_DIAG=ON` | Replace the authenticator with the PUF diagnostic |
+| `-DFIDELIO_BENCH=ON` | Replace the authenticator with the wolfCrypt benchmark |
+| `-DFIDELIO_BENCH_CLOCK_KHZ=48000` | Set the benchmark system clock |
+| `-DFIDELIO_ALG_PROBE=ON` | Force-link the algorithm sizing probe |
+| `-DFIDELIO_EXTRA_DEFS=...` | Add wolfSSL feature macros for development builds |
+
+To add a board, define its `PRESENCE_BUTTON`, LED type, and available ADC
+entropy channels in `src/pins.h`, then map a new `BOARD` value to that definition
+in `CMakeLists.txt`. GPIO 26+N corresponds to ADC channel N; do not list a
+channel whose GPIO is used by another function. On the RP2040-Zero, GPIO29 is
+the button, so its ADC channel 3 is deliberately excluded.
+
+## Testing and integrations
+
+Run the host-side COSE wire-format regression test with:
+
+```sh
+make -C tests run
+```
+
+For GitHub, open **Settings → Password and authentication → Two-factor
+authentication → Security keys**, register a new key, and press the Fidelio
+button when asked. Always configure a separate recovery method.
+
+For Linux PAM/U2F, install `libpam-u2f` and `pamu2fcfg`, then follow their
+distribution documentation. For CTAP2 resident credentials, use `fido2-tools`
+and `libpam-fido2`. Keep a root console open while changing `/etc/pam.d` and
+test each change immediately to avoid locking yourself out.
+
+## License
+
+Fidelio is licensed under the [GNU General Public License, version 3 or
+later](LICENSE). It links wolfSSL and wolfCOSE, which are also GPLv3. wolfSSL
+Inc. offers commercial licenses for proprietary use; see
+`lib/wolfssl/LICENSING`.
