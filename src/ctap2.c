@@ -97,27 +97,12 @@ extern void ForceZero(void* mem, word32 len);
 #define CRED_ID_LEN CRED_ID_LEN_MAX
 
 
-/* CBOR (RFC 8949) encoding and decoding is provided by wolfCOSE. The thin
- * wrappers below only set up a WOLFCOSE_CBOR_CTX and keep the call sites
- * readable; wolfCOSE returns WOLFCOSE_SUCCESS (0) or a negative error code,
- * which matches the 0/-1 convention used throughout this file.
+/* CBOR (RFC 8949) encoding and decoding is provided by wolfCOSE. The helpers
+ * below add only what wolfCOSE deliberately leaves to the caller: bounding
+ * decoded lengths and counts to what this authenticator accepts. wolfCOSE
+ * returns WOLFCOSE_SUCCESS (0) or a negative error code, which matches the
+ * 0/-1 convention used throughout this file.
  */
-static void cbor_enc_init(WOLFCOSE_CBOR_CTX *c, uint8_t *buf, uint16_t cap,
-                          uint16_t off)
-{
-    c->buf = buf;
-    c->cbuf = NULL;
-    c->bufSz = cap;
-    c->idx = off;
-}
-
-static void cbor_dec_init(WOLFCOSE_CBOR_CTX *c, const uint8_t *buf, uint16_t len)
-{
-    c->buf = NULL;
-    c->cbuf = buf;
-    c->bufSz = len;
-    c->idx = 0;
-}
 
 /* Text strings in CTAP2 replies are all string literals. */
 static int cbor_put_text(WOLFCOSE_CBOR_CTX *c, const char *s)
@@ -183,24 +168,6 @@ static int cbor_read_array(WOLFCOSE_CBOR_CTX *c, uint32_t *items)
     if (count > c->bufSz)
         return -1;
     *items = (uint32_t)count;
-    return 0;
-}
-
-/* Skip one complete item and hand back the slice it occupied, so callers can
- * re-parse it later (allowList entries, embedded COSE_Key maps).
- */
-static int cbor_skip_slice(WOLFCOSE_CBOR_CTX *c, const uint8_t **slice,
-                           uint16_t *slice_len)
-{
-    size_t start = c->idx;
-    if (wc_CBOR_Skip(c) != WOLFCOSE_SUCCESS)
-        return -1;
-    if ((c->idx - start) > UINT16_MAX)
-        return -1;
-    if (slice)
-        *slice = c->cbuf + start;
-    if (slice_len)
-        *slice_len = (uint16_t)(c->idx - start);
     return 0;
 }
 
@@ -615,14 +582,13 @@ static int encode_cose_pubkey(WOLFCOSE_CBOR_CTX *c, ecc_key *ecc, int32_t alg)
     if (wc_CoseKey_SetEcc(&key, WOLFCOSE_CRV_P256, ecc) != WOLFCOSE_SUCCESS)
         return -1;
     key.alg = alg;
-    /* Both callers pass a key that still holds its private scalar.
-     * wc_CoseKey_SetEcc() sets hasPrivate for those, and wc_CoseKey_Encode()
-     * would then serialise -4:d into a reply that goes out over USB. This
-     * serialiser is public-key-only by contract, so clear it explicitly.
+    /* Both callers pass a key that still holds its private scalar, and
+     * wc_CoseKey_SetEcc() sets hasPrivate for those. This serialiser is
+     * public-key-only by contract, so ask wolfCOSE to omit -4:d rather than
+     * let it reach a reply that goes out over USB.
      */
-    key.hasPrivate = 0;
-    if (wc_CoseKey_Encode(&key, c->buf + c->idx, c->bufSz - c->idx,
-                          &written) != WOLFCOSE_SUCCESS)
+    if (wc_CoseKey_Encode_ex(&key, c->buf + c->idx, c->bufSz - c->idx, &written,
+                             WOLFCOSE_KEY_PUBLIC_ONLY) != WOLFCOSE_SUCCESS)
         return -1;
     c->idx += written;
     return 0;
@@ -658,7 +624,7 @@ static int build_authdata_attested(const uint8_t *rpIdHash, uint8_t flags, uint3
     memcpy(&authData[idx], credId, credIdLen);
     idx += credIdLen;
 
-    cbor_enc_init(&cose, &authData[idx], (uint16_t)(authDataCap - idx), 0);
+    wc_CBOR_EncoderInit(&cose, &authData[idx], (size_t)(authDataCap - idx));
     if (cred_alg_pubkey_cose(pubkey, &cose) != 0)
         return -1;
     idx += (uint16_t)cose.idx;
@@ -700,7 +666,7 @@ static int build_authdata_assert(const uint8_t *rpIdHash, uint8_t flags, uint32_
  * kty/crv against the attached key type and imports the point; the import
  * itself rejects anything that is not on the curve.
  */
-static int parse_cose_pubkey(const uint8_t *buf, uint16_t len, uint8_t *qx, uint8_t *qy)
+static int parse_cose_pubkey(const uint8_t *buf, size_t len, uint8_t *qx, uint8_t *qy)
 {
     WOLFCOSE_KEY key;
     ecc_key ecc;
@@ -793,40 +759,12 @@ struct ga_params {
     int hs_pin_protocol;
 };
 
-/* Read a map key that may be encoded either as an unsigned int (CTAP2
- * canonical) or as a text label, which some clients still emit inside
- * pubKeyCredParams and allowList entries.
+/* Map keys inside pubKeyCredParams and allowList entries may be encoded
+ * either as an integer (CTAP2 canonical) or as a text label, which some
+ * clients still emit. wc_CBOR_DecodeLabel() accepts both; LBL_TXT() spells
+ * out a literal for wc_CBOR_LabelIsText().
  */
-struct cbor_key {
-    bool is_text;
-    uint64_t num;
-    const uint8_t *text;
-    uint32_t text_len;
-};
-
-static int cbor_read_key(WOLFCOSE_CBOR_CTX *c, struct cbor_key *k)
-{
-    memset(k, 0, sizeof(*k));
-    switch (wc_CBOR_PeekType(c)) {
-        case WOLFCOSE_CBOR_UINT:
-            if (wc_CBOR_DecodeUint(c, &k->num) != WOLFCOSE_SUCCESS)
-                return -1;
-            return 0;
-        case WOLFCOSE_CBOR_TSTR:
-            k->is_text = true;
-            return cbor_read_text(c, &k->text, &k->text_len);
-        default:
-            return -1;
-    }
-}
-
-static bool cbor_key_is(const struct cbor_key *k, uint64_t num, const char *lit)
-{
-    if (!k->is_text)
-        return k->num == num;
-    return k->text_len == strlen(lit) &&
-           memcmp(k->text, lit, k->text_len) == 0;
-}
+#define LBL_TXT(s) (const uint8_t *)(s), (sizeof(s) - 1)
 
 /* Read a CBOR true/false into *out, leaving *out untouched for other types. */
 static int cbor_read_bool(WOLFCOSE_CBOR_CTX *c, bool *out)
@@ -845,7 +783,7 @@ static int parse_makecred(const uint8_t *buf, uint16_t len, struct mc_params *ou
     uint32_t items;
 
     memset(out, 0, sizeof(*out));
-    cbor_dec_init(&c, buf, len);
+    wc_CBOR_DecoderInit(&c, buf, len);
     if (cbor_read_map(&c, &items) != 0)
         return -1;
 
@@ -910,16 +848,19 @@ static int parse_makecred(const uint8_t *buf, uint16_t len, struct mc_params *ou
                     if (cbor_read_map(&c, &mitems) != 0)
                         return -1;
                     for (uint32_t k = 0; k < mitems; k++) {
-                        struct cbor_key mkey;
-                        if (cbor_read_key(&c, &mkey) != 0)
+                        WOLFCOSE_CBOR_LABEL mkey;
+                        if (wc_CBOR_DecodeLabel(&c, &mkey) != WOLFCOSE_SUCCESS)
                             return -1;
-                        if (cbor_key_is(&mkey, 1, "type")) {
+                        if (wc_CBOR_LabelIsInt(&mkey, 1) ||
+                            wc_CBOR_LabelIsText(&mkey, LBL_TXT("type"))) {
                             const uint8_t *tv; uint32_t tvlen;
                             if (cbor_read_text(&c, &tv, &tvlen) != 0)
                                 return -1;
                             if (tvlen == 10 && memcmp(tv, "public-key", 10) == 0)
                                 type_ok = true;
-                        } else if (cbor_key_is(&mkey, 3, "alg")) {
+                        } else if (wc_CBOR_LabelIsInt(&mkey, 3) ||
+                                   wc_CBOR_LabelIsText(&mkey,
+                                                       LBL_TXT("alg"))) {
                             int64_t aval;
                             if (wc_CBOR_DecodeInt(&c, &aval) != WOLFCOSE_SUCCESS)
                                 return -1;
@@ -989,23 +930,23 @@ static int parse_makecred(const uint8_t *buf, uint16_t len, struct mc_params *ou
     return 0;
 }
 
-static int parse_hmac_secret_input(const uint8_t *buf, uint16_t len, struct ga_params *out)
+static int parse_hmac_secret_input(const uint8_t *buf, size_t len, struct ga_params *out)
 {
     WOLFCOSE_CBOR_CTX c;
     uint32_t items;
 
-    cbor_dec_init(&c, buf, len);
+    wc_CBOR_DecoderInit(&c, buf, len);
     if (cbor_read_map(&c, &items) != 0)
         return -1;
 
     for (uint32_t i = 0; i < items; i++) {
-        struct cbor_key key;
+        WOLFCOSE_CBOR_LABEL key;
         uint32_t iitems;
 
-        if (cbor_read_key(&c, &key) != 0)
+        if (wc_CBOR_DecodeLabel(&c, &key) != WOLFCOSE_SUCCESS)
             return -1;
         /* The extension is always identified by its text name. */
-        if (!key.is_text || !cbor_key_is(&key, 0, "hmac-secret")) {
+        if (!wc_CBOR_LabelIsText(&key, LBL_TXT("hmac-secret"))) {
             if (wc_CBOR_Skip(&c) != WOLFCOSE_SUCCESS)
                 return -1;
             continue;
@@ -1015,32 +956,36 @@ static int parse_hmac_secret_input(const uint8_t *buf, uint16_t len, struct ga_p
         if (cbor_read_map(&c, &iitems) != 0)
             return -1;
         for (uint32_t j = 0; j < iitems; j++) {
-            struct cbor_key ikey;
-            if (cbor_read_key(&c, &ikey) != 0)
+            WOLFCOSE_CBOR_LABEL ikey;
+            if (wc_CBOR_DecodeLabel(&c, &ikey) != WOLFCOSE_SUCCESS)
                 return -1;
 
-            if (cbor_key_is(&ikey, 1, "keyAgreement")) {
-                const uint8_t *slice; uint16_t slice_len;
-                if (cbor_skip_slice(&c, &slice, &slice_len) != 0)
+            if (wc_CBOR_LabelIsInt(&ikey, 1) ||
+                wc_CBOR_LabelIsText(&ikey, LBL_TXT("keyAgreement"))) {
+                const uint8_t *slice; size_t slice_len;
+                if (wc_CBOR_SkipItem(&c, &slice, &slice_len) != WOLFCOSE_SUCCESS)
                     return -1;
                 if (parse_cose_pubkey(slice, slice_len, out->hs_platform_qx,
                                       out->hs_platform_qy) != 0)
                     return -1;
                 out->hmac_secret_requested = true;
                 out->hs_key_set = true;
-            } else if (cbor_key_is(&ikey, 2, "saltEnc")) {
+            } else if (wc_CBOR_LabelIsInt(&ikey, 2) ||
+                       wc_CBOR_LabelIsText(&ikey, LBL_TXT("saltEnc"))) {
                 if (cbor_read_bytes(&c, &out->hs_salt_enc, &out->hs_salt_enc_len) != 0)
                     return -1;
                 if (out->hs_salt_enc_len != 32 && out->hs_salt_enc_len != 64)
                     return -1;
                 out->hmac_secret_requested = true;
-            } else if (cbor_key_is(&ikey, 3, "saltAuth")) {
+            } else if (wc_CBOR_LabelIsInt(&ikey, 3) ||
+                       wc_CBOR_LabelIsText(&ikey, LBL_TXT("saltAuth"))) {
                 if (cbor_read_bytes(&c, &out->hs_salt_auth, &out->hs_salt_auth_len) != 0)
                     return -1;
                 if (out->hs_salt_auth_len != 16)
                     return -1;
                 out->hmac_secret_requested = true;
-            } else if (cbor_key_is(&ikey, 4, "pinProtocol")) {
+            } else if (wc_CBOR_LabelIsInt(&ikey, 4) ||
+                       wc_CBOR_LabelIsText(&ikey, LBL_TXT("pinProtocol"))) {
                 uint64_t v;
                 if (wc_CBOR_DecodeUint(&c, &v) != WOLFCOSE_SUCCESS)
                     return -1;
@@ -1066,7 +1011,7 @@ static int parse_getassert(const uint8_t *buf, uint16_t len, struct ga_params *o
     uint32_t items;
     memset(out, 0, sizeof(*out));
 
-    cbor_dec_init(&c, buf, len);
+    wc_CBOR_DecoderInit(&c, buf, len);
     if (cbor_read_map(&c, &items) != 0)
         return -1;
 
@@ -1108,8 +1053,8 @@ static int parse_getassert(const uint8_t *buf, uint16_t len, struct ga_params *o
                 break;
             }
             case 4: { /* extensions */
-                const uint8_t *slice; uint16_t slice_len;
-                if (cbor_skip_slice(&c, &slice, &slice_len) != 0)
+                const uint8_t *slice; size_t slice_len;
+                if (wc_CBOR_SkipItem(&c, &slice, &slice_len) != WOLFCOSE_SUCCESS)
                     return -1;
                 if (parse_hmac_secret_input(slice, slice_len, out) != 0)
                     return -1;
@@ -1221,7 +1166,7 @@ static int ctap2_write_getinfo(uint8_t *reply, uint16_t reply_max, uint16_t *rep
         return -1;
 
     /* Reserve status byte at [0]; CBOR starts at [1]. */
-    cbor_enc_init(&c, reply, reply_max, 1);
+    wc_CBOR_EncoderInit(&c, reply + 1, (size_t)(reply_max - 1));
     reply[0] = CTAP2_ERR_SUCCESS;
 
     /* Map entries: versions, extensions, aaguid, options, maxMsgSize, pinProtocols,
@@ -1298,7 +1243,7 @@ static int ctap2_write_getinfo(uint8_t *reply, uint16_t reply_max, uint16_t *rep
         }
     }
 
-    *reply_len = (uint16_t)c.idx;
+    *reply_len = (uint16_t)(c.idx + 1);
     return 0;
 }
 
@@ -1460,7 +1405,7 @@ static int ctap2_make_credential(const uint8_t *payload, uint16_t payload_len,
 
     /* Build response */
     WOLFCOSE_CBOR_CTX c;
-    cbor_enc_init(&c, reply, reply_max, 1);
+    wc_CBOR_EncoderInit(&c, reply + 1, (size_t)(reply_max - 1));
     reply[0] = CTAP2_ERR_SUCCESS;
     if (wc_CBOR_EncodeMapStart(&c, 3) != 0) { ret = -1; goto cleanup; }
     if (wc_CBOR_EncodeUint(&c, 1) != 0) { ret = -1; goto cleanup; }
@@ -1477,7 +1422,7 @@ static int ctap2_make_credential(const uint8_t *payload, uint16_t payload_len,
     if (wc_CBOR_EncodeArrayStart(&c, 1) != 0) { ret = -1; goto cleanup; }
     if (wc_CBOR_EncodeBstr(&c, cert_att_der, cert_att_der_len) != 0) { ret = -1; goto cleanup; }
 
-    *reply_len = (uint16_t)c.idx;
+    *reply_len = (uint16_t)(c.idx + 1);
     ret = 0;
 
 cleanup:
@@ -1587,23 +1532,25 @@ static int ctap2_get_assertion(const uint8_t *payload, uint16_t payload_len,
             const uint8_t *desc_id = NULL; uint32_t desc_id_len = 0;
             bool desc_ok = true;
 
-            cbor_dec_init(&ac, params.allow_list + allow_off,
-                          (uint16_t)(params.allow_list_len - allow_off));
+            wc_CBOR_DecoderInit(&ac, params.allow_list + allow_off,
+                                params.allow_list_len - allow_off);
             if (cbor_read_map(&ac, &mitems) != 0)
                 break;
             for (uint32_t j = 0; j < mitems; j++) {
-                struct cbor_key mkey;
-                if (cbor_read_key(&ac, &mkey) != 0) {
+                WOLFCOSE_CBOR_LABEL mkey;
+                if (wc_CBOR_DecodeLabel(&ac, &mkey) != WOLFCOSE_SUCCESS) {
                     desc_ok = false;
                     break;
                 }
-                if (cbor_key_is(&mkey, 1, "type")) {
+                if (wc_CBOR_LabelIsInt(&mkey, 1) ||
+                    wc_CBOR_LabelIsText(&mkey, LBL_TXT("type"))) {
                     const uint8_t *tv; uint32_t tvlen;
                     if (cbor_read_text(&ac, &tv, &tvlen) != 0) {
                         desc_ok = false;
                         break;
                     }
-                } else if (cbor_key_is(&mkey, 2, "id")) {
+                } else if (wc_CBOR_LabelIsInt(&mkey, 2) ||
+                           wc_CBOR_LabelIsText(&mkey, LBL_TXT("id"))) {
                     if (cbor_read_bytes(&ac, &desc_id, &desc_id_len) != 0) {
                         desc_ok = false;
                         break;
@@ -1726,7 +1673,7 @@ static int ctap2_get_assertion(const uint8_t *payload, uint16_t payload_len,
         wc_AesFree(&aes);
 
         WOLFCOSE_CBOR_CTX ext;
-        cbor_enc_init(&ext, ext_buf, sizeof(ext_buf), 0);
+        wc_CBOR_EncoderInit(&ext, ext_buf, sizeof(ext_buf));
         if (wc_CBOR_EncodeMapStart(&ext, 1) != 0) { hs_fail(CTAP2_ERR_INVALID_COMMAND); }
         if (cbor_put_text(&ext, "hmac-secret") != 0) { hs_fail(CTAP2_ERR_INVALID_COMMAND); }
         if (wc_CBOR_EncodeBstr(&ext, salt_dec, params.hs_salt_enc_len) != 0) { hs_fail(CTAP2_ERR_INVALID_COMMAND); }
@@ -1764,7 +1711,7 @@ static int ctap2_get_assertion(const uint8_t *payload, uint16_t payload_len,
     /* No signature counter to advance (see CTAP2_SIGN_COUNT). */
 
     WOLFCOSE_CBOR_CTX c;
-    cbor_enc_init(&c, reply, reply_max, 1);
+    wc_CBOR_EncoderInit(&c, reply + 1, (size_t)(reply_max - 1));
     reply[0] = CTAP2_ERR_SUCCESS;
     /* A discoverable assertion additionally returns the user entity (4) so
      * the relying party knows which account signed in. */
@@ -1793,7 +1740,7 @@ static int ctap2_get_assertion(const uint8_t *payload, uint16_t payload_len,
     if (wc_CBOR_EncodeUint(&c, 5) != 0) { ret = -1; goto ga_cleanup; }
     if (wc_CBOR_EncodeUint(&c, disc ? disc_count : 1) != 0) { ret = -1; goto ga_cleanup; }
 
-    *reply_len = (uint16_t)c.idx;
+    *reply_len = (uint16_t)(c.idx + 1);
 
 ga_cleanup:
     wc_FreeRng(&rng);
@@ -1819,7 +1766,7 @@ static int ctap2_client_pin_inner(const uint8_t *payload, uint16_t payload_len,
     WOLFCOSE_CBOR_CTX c;
     uint32_t items;
     uint32_t pinProtocol = 0, subCmd = 0;
-    const uint8_t *key_agree = NULL; uint16_t key_agree_len = 0;
+    const uint8_t *key_agree = NULL; size_t key_agree_len = 0;
     const uint8_t *pin_auth = NULL; uint32_t pin_auth_len = 0;
     const uint8_t *newPinEnc = NULL; uint32_t newPinEnc_len = 0;
     const uint8_t *pinHashEnc = NULL; uint32_t pinHashEnc_len = 0;
@@ -1830,7 +1777,7 @@ static int ctap2_client_pin_inner(const uint8_t *payload, uint16_t payload_len,
 
     pin_state_load();
 
-    cbor_dec_init(&c, payload + 1, (uint16_t)(payload_len - 1));
+    wc_CBOR_DecoderInit(&c, payload + 1, (size_t)(payload_len - 1));
     if (cbor_read_map(&c, &items) != 0)
         return -1;
     for (uint32_t i = 0; i < items; i++) {
@@ -1853,7 +1800,8 @@ static int ctap2_client_pin_inner(const uint8_t *payload, uint16_t payload_len,
                 break;
             }
             case 3: /* keyAgreement */
-                if (cbor_skip_slice(&c, &key_agree, &key_agree_len) != 0)
+                if (wc_CBOR_SkipItem(&c, &key_agree,
+                                     &key_agree_len) != WOLFCOSE_SUCCESS)
                     return -1;
                 break;
             case 4: /* pinAuth */
@@ -1882,12 +1830,12 @@ static int ctap2_client_pin_inner(const uint8_t *payload, uint16_t payload_len,
     switch (subCmd) {
         case 1: { /* getRetries */
             WOLFCOSE_CBOR_CTX rc;
-            cbor_enc_init(&rc, reply, reply_max, 1);
+            wc_CBOR_EncoderInit(&rc, reply + 1, (size_t)(reply_max - 1));
             reply[0] = CTAP2_ERR_SUCCESS;
             if (wc_CBOR_EncodeMapStart(&rc, 1) != 0) return -1;
             if (wc_CBOR_EncodeUint(&rc, 3) != 0) return -1; /* PIN_RETRIES */
             if (wc_CBOR_EncodeUint(&rc, pin_store.retries) != 0) return -1;
-            *reply_len = (uint16_t)rc.idx;
+            *reply_len = (uint16_t)(rc.idx + 1);
             return 0;
         }
         case 2: { /* getKeyAgreement */
@@ -1898,13 +1846,13 @@ static int ctap2_client_pin_inner(const uint8_t *payload, uint16_t payload_len,
                 reply[0] = CTAP2_ERR_INVALID_COMMAND; *reply_len = 1; return 0;
             }
             wc_FreeRng(&rng);
-            cbor_enc_init(&rc, reply, reply_max, 1);
+            wc_CBOR_EncoderInit(&rc, reply + 1, (size_t)(reply_max - 1));
             reply[0] = CTAP2_ERR_SUCCESS;
             if (wc_CBOR_EncodeMapStart(&rc, 1) != 0) return -1;
             if (wc_CBOR_EncodeUint(&rc, 1) != 0) return -1;
             if (encode_cose_pubkey(&rc, &pin_agree_key,
                                    COSE_ALG_ECDH_ES_HKDF256) != 0) return -1;
-            *reply_len = (uint16_t)rc.idx;
+            *reply_len = (uint16_t)(rc.idx + 1);
             return 0;
         }
         case 3: { /* setPIN */
@@ -1958,10 +1906,10 @@ static int ctap2_client_pin_inner(const uint8_t *payload, uint16_t payload_len,
             pin_reset_token(&rng);
             wc_FreeRng(&rng);
             WOLFCOSE_CBOR_CTX rc;
-            cbor_enc_init(&rc, reply, reply_max, 1);
+            wc_CBOR_EncoderInit(&rc, reply + 1, (size_t)(reply_max - 1));
             reply[0] = CTAP2_ERR_SUCCESS;
             if (wc_CBOR_EncodeMapStart(&rc, 0) != 0) return -1;
-            *reply_len = (uint16_t)rc.idx;
+            *reply_len = (uint16_t)(rc.idx + 1);
             return 0;
         }
         case 4: { /* changePIN */
@@ -2037,10 +1985,10 @@ static int ctap2_client_pin_inner(const uint8_t *payload, uint16_t payload_len,
             pin_reset_token(&rng);
             wc_FreeRng(&rng);
             WOLFCOSE_CBOR_CTX rc;
-            cbor_enc_init(&rc, reply, reply_max, 1);
+            wc_CBOR_EncoderInit(&rc, reply + 1, (size_t)(reply_max - 1));
             reply[0] = CTAP2_ERR_SUCCESS;
             if (wc_CBOR_EncodeMapStart(&rc, 0) != 0) return -1;
-            *reply_len = (uint16_t)rc.idx;
+            *reply_len = (uint16_t)(rc.idx + 1);
             return 0;
         }
         case 5: { /* getPINToken */
@@ -2089,12 +2037,12 @@ static int ctap2_client_pin_inner(const uint8_t *payload, uint16_t payload_len,
                 if (wc_AesCbcEncrypt(&aes, pin_tmp, pin_token, sizeof(pin_token)) != 0) { wc_AesFree(&aes); wc_FreeRng(&rng); reply[0] = CTAP2_ERR_PIN_AUTH_INVALID; *reply_len = 1; return 0; }
                 wc_AesFree(&aes);
                 WOLFCOSE_CBOR_CTX rc;
-                cbor_enc_init(&rc, reply, reply_max, 1);
+                wc_CBOR_EncoderInit(&rc, reply + 1, (size_t)(reply_max - 1));
                 reply[0] = CTAP2_ERR_SUCCESS;
                 if (wc_CBOR_EncodeMapStart(&rc, 1) != 0) { wc_FreeRng(&rng); return -1; }
                 if (wc_CBOR_EncodeUint(&rc, 2) != 0) { wc_FreeRng(&rng); return -1; }
                 if (wc_CBOR_EncodeBstr(&rc, pin_tmp, enc_len) != 0) { wc_FreeRng(&rng); return -1; }
-                *reply_len = (uint16_t)rc.idx;
+                *reply_len = (uint16_t)(rc.idx + 1);
                 wc_FreeRng(&rng);
                 return 0;
             }

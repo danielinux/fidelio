@@ -97,26 +97,24 @@ static int cose_encode_from_key(uint8_t *out, size_t outSz, size_t *outLen,
     if (wc_CoseKey_Init(&key) != WOLFCOSE_SUCCESS) return -1;
     if (wc_CoseKey_SetEcc(&key, WOLFCOSE_CRV_P256, ecc) != WOLFCOSE_SUCCESS) return -1;
     key.alg = alg;
-    key.hasPrivate = 0;
-    if (wc_CoseKey_Encode(&key, out, outSz, outLen) != WOLFCOSE_SUCCESS) return -1;
+    if (wc_CoseKey_Encode_ex(&key, out, outSz, outLen,
+                             WOLFCOSE_KEY_PUBLIC_ONLY) != WOLFCOSE_SUCCESS)
+        return -1;
     return 0;
 }
 
-/* Helper for cases that only have raw coordinates. */
+/* Helper for cases that only have raw coordinates. No ecc_key is needed to
+ * serialise them, so this is an independent path to the same bytes.
+ */
 static int new_encode_cose_pubkey(uint8_t *out, size_t outSz, size_t *outLen,
                                   const uint8_t *qx, const uint8_t *qy,
                                   int32_t alg)
 {
-    ecc_key ecc;
-    int ret = -1;
-
-    if (wc_ecc_init(&ecc) != 0) return -1;
-    if (wc_ecc_import_unsigned(&ecc, (byte *)qx, (byte *)qy, NULL, ECC_SECP256R1) != 0)
-        goto out;
-    ret = cose_encode_from_key(out, outSz, outLen, &ecc, alg);
-out:
-    wc_ecc_free(&ecc);
-    return ret;
+    if (wc_CoseKey_EncodeEccRaw(WOLFCOSE_CRV_P256, qx, qy, NULL, ECC_SZ,
+                                NULL, 0, alg, out, outSz,
+                                outLen) != WOLFCOSE_SUCCESS)
+        return -1;
+    return 0;
 }
 
 /* The real hot path: encode straight from a key that still holds its private

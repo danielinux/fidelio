@@ -332,14 +332,12 @@ int cred_alg_pubkey_cose(struct cred_key *key, WOLFCOSE_CBOR_CTX *c)
     }
 
     ck.alg = key->alg->cose;
-    /* Every key here still holds its private half; wc_CoseKey_Set*() records
-     * that and wc_CoseKey_Encode() would serialise it into a reply that goes
-     * out over USB. This is a public-key-only serialiser by contract.
+    /* Every key here still holds its private half, and wc_CoseKey_Set*()
+     * records that. This is a public-key-only serialiser by contract, so ask
+     * wolfCOSE to leave the private half out of a reply bound for USB.
      */
-    ck.hasPrivate = 0;
-
-    if (wc_CoseKey_Encode(&ck, c->buf + c->idx, c->bufSz - c->idx,
-                          &written) != WOLFCOSE_SUCCESS)
+    if (wc_CoseKey_Encode_ex(&ck, c->buf + c->idx, c->bufSz - c->idx, &written,
+                             WOLFCOSE_KEY_PUBLIC_ONLY) != WOLFCOSE_SUCCESS)
         return -1;
     c->idx += written;
     return 0;
