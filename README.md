@@ -62,21 +62,7 @@ git submodule update --init --single-branch \
 git -C pico-sdk submodule update --init --single-branch lib/tinyusb
 ```
 
-### 4. Create the attestation identity
-
-Run this once for each device identity:
-
-```sh
-./mkcert.sh
-```
-
-This generates an attestation certificate and embeds it in `src/cert.c`. Edit
-`attestation-cert.conf` first if you want to customize the certificate fields.
-Do not share `cert-master-key.pem`: it is the attestation private key. It is
-separate from the authenticator master secret described in [Security
-model](#security-model).
-
-### 5. Build the firmware
+### 4. Build the firmware
 
 For a Raspberry Pi Pico:
 
@@ -89,7 +75,7 @@ For a Waveshare RP2040-Zero, add `-DBOARD=rp2040-zero` to the configure command.
 An unknown `BOARD` value is rejected rather than silently selecting another
 pinout.
 
-### 6. Flash and enroll the device
+### 5. Flash and enroll the device
 
 Hold BOOTSEL while connecting the board, then copy the UF2 file to the mounted
 `RPI-RP2` volume:
@@ -109,7 +95,7 @@ The first enrollment takes two cold boots:
 If it blinks twice, unplug it and try another cold boot. See [LED halt
 codes](#led-halt-codes) for details.
 
-### 7. Check the key and set a PIN
+### 6. Check the key and set a PIN
 
 On Linux, find the HID device and set a PIN with `fido2-tools`:
 
@@ -174,6 +160,15 @@ Consequently, copying one device's flash to a different RP2040 does not clone
 the authenticator: the other chip has a different SRAM response and derives
 different keys. The master secret exists in RAM only while the enrolled device
 is powered.
+
+The attestation key is derived from the same master secret, so it is unique
+to each device and never leaves it. The self-signed certificate that carries
+its public key is built on demand and kept in RAM only; a CTAP2 reset rotates
+the PUF salt and re-derives a fresh identity before the next attestation.
+This is basic (self-signed) attestation: no relying party has this key on a CA
+list, so the certificate is not verifiable to them. What it gives is
+per-device uniqueness: extracting the key from one unit no longer forges
+attestations for the fleet.
 
 Fidelio reports a WebAuthn signature counter of zero. WebAuthn permits this,
 and a global counter would allow activity at different relying parties to be
