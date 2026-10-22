@@ -42,6 +42,7 @@ extern void ForceZero(void* mem, word32 len);
 #define CTAP2_ERR_PIN_BLOCKED        0x34
 #define CTAP2_ERR_PIN_NOT_SET        0x35
 #define CTAP2_ERR_PIN_AUTH_INVALID   0x33
+#define CTAP2_ERR_PIN_POLICY_VIOLATION 0x37
 #define CTAP2_ERR_KEY_STORE_FULL     0x28
 #define CTAP2_ERR_USER_ACTION_TIMEOUT 0x3A
 
@@ -1922,6 +1923,12 @@ static int ctap2_client_pin_inner(const uint8_t *payload, uint16_t payload_len,
                 if (pin_tmp[i] == 0) { pin_len = (uint16_t)i; break; }
             }
             if (pin_len == 0) pin_len = 64;
+            if (pin_len < 4 || pin_len > 63) {
+                reply[0] = CTAP2_ERR_PIN_POLICY_VIOLATION; *reply_len = 1; return 0;
+            }
+            if (!indicator_wait_for_button(0x20, 0x20, 0)) {
+                reply[0] = CTAP2_ERR_USER_ACTION_TIMEOUT; *reply_len = 1; return 0;
+            }
             if (pin_hash_plain(pin_tmp, pin_len, pin_store.pin_hash) != 0) {
                 reply[0] = CTAP2_ERR_PIN_AUTH_INVALID; *reply_len = 1; return 0;
             }
@@ -2006,6 +2013,9 @@ static int ctap2_client_pin_inner(const uint8_t *payload, uint16_t payload_len,
                 if (pin_tmp[i] == 0) { pin_len = (uint16_t)i; break; }
             }
             if (pin_len == 0) pin_len = 64;
+            if (pin_len < 4 || pin_len > 63) {
+                return write_error(CTAP2_ERR_PIN_POLICY_VIOLATION, reply, reply_len);
+            }
             if (pin_hash_plain(pin_tmp, pin_len, pin_store.pin_hash) != 0) {
                 reply[0] = CTAP2_ERR_PIN_AUTH_INVALID; *reply_len = 1; return 0;
             }

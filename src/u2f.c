@@ -215,6 +215,7 @@ static uint8_t U2F_cmd_reply[RESPONSE_MAX_SIZE];
 static uint32_t U2F_cmd_reply_sent = 0;
 static uint32_t U2F_cmd_reply_size = 0;
 static uint32_t U2F_cmd_reply_seq = 0;
+static uint32_t U2F_cmd_reply_cid = 0;
 
 static int ctaphid_send(uint8_t cmd, uint16_t sz, bool append_status_word)
 {
@@ -235,6 +236,7 @@ static int ctaphid_send(uint8_t cmd, uint16_t sz, bool append_status_word)
 
     ip = (struct u2fhid_init_packet *)u2h_msg;
     ip->cid = U2F_Message.cid;
+    U2F_cmd_reply_cid = U2F_Message.cid;
     ip->hid_cmd = 0x80 | cmd;
     ip->payload_len[0] = ((U2F_cmd_reply_size) & 0xFF00) >> 8;
     ip->payload_len[1] = (U2F_cmd_reply_size) & 0xFF;
@@ -287,6 +289,14 @@ static const uint8_t P256_ORDER[32] = {
     0xBC, 0xE6, 0xFA, 0xAD, 0xA7, 0x17, 0x9E, 0x84,
     0xF3, 0xB9, 0xCA, 0xC2, 0xFC, 0x63, 0x25, 0x51
 };
+
+static bool constant_time_equal(const uint8_t *a, const uint8_t *b, size_t n)
+{
+    uint8_t diff = 0;
+    for (size_t i = 0; i < n; i++)
+        diff |= a[i] ^ b[i];
+    return diff == 0;
+}
 
 static void p256_reduce_scalar(uint8_t *s)
 {
@@ -345,7 +355,8 @@ static uint16_t fido_register(struct u2f_raw_hdr *hdr, uint16_t len)
     memset(&user_ecc, 0, sizeof(user_ecc));
     memset(&cert_ecc, 0, sizeof(cert_ecc));
     (void)hdr;
-    (void)len;
+    if (len != PARAM_SZ * 2)
+        return EWRONGLEN;
 
     if (!indicator_wait_for_button(0, 0x20, 0))
         return ECOND;
@@ -505,36 +516,23 @@ static uint16_t fido_auth(struct u2f_raw_hdr *hdr, uint16_t len)
     Sha256 sha;
     int ret;
 
-    (void)len;
+    if (len < PARAM_SZ * 2 + 1)
+        return EWRONGLEN;
     msg_data = U2F_Message.data + sizeof(struct u2f_raw_hdr);
     control = hdr->p1;
     challenge = msg_data;
     application = msg_data + PARAM_SZ;
     handle_sz = msg_data[PARAM_SZ + PARAM_SZ];
+    if (handle_sz != NONCE_SZ + HASH_SZ || len != PARAM_SZ * 2 + 1 + handle_sz)
+        return EWRONGLEN;
     handle_nonce = msg_data + PARAM_SZ + PARAM_SZ + 1;
     handle_hash = msg_data + PARAM_SZ + PARAM_SZ + 1 + NONCE_SZ;
     /* Zeroed so the cleanup path can free it on every route, including one
      * that failed before the initialiser ran. */
     memset(&user_ecc, 0, sizeof(user_ecc));
 
-    switch (control) {
-        case 0x07: /* "check-only" */
-        case 0x08: /* Sign with no presence */
-            break;
-        case 0x03:
-            /* "enforce-user-presence-and-sign": the button was pressed, so
-             * the response must say so. This byte is both returned to the
-             * relying party and hashed into the signature, so leaving it at
-             * zero makes every U2F login fail with "User Present flag not
-             * set" -- the verifier is reading exactly what we sent.
-             */
-            if (!indicator_wait_for_button(0,0,0x20))
-                return ECOND;
-            user_presence = 0x01;
-            break;
-        default:
-            return EWRONGDATA;
-    }
+    if (control != 0x07 && control != 0x03)
+        return EWRONGDATA;
 
     if (wc_InitRng(&rng) != 0)
         return 0x6110;
@@ -582,7 +580,7 @@ static uint16_t fido_auth(struct u2f_raw_hdr *hdr, uint16_t len)
     wc_HmacUpdate(&hmac, private, ECC_SZ);
     wc_HmacFinal(&hmac, handle_calculated_hash);
     wc_HmacFree(&hmac);
-    if (memcmp(handle_calculated_hash, handle_hash, HASH_SZ) != 0)
+    if (!constant_time_equal(handle_calculated_hash, handle_hash, HASH_SZ))
         goto cleanup;
 
     if (wc_ecc_import_private_key_ex(private, ECC_SZ, NULL, 0,
@@ -601,6 +599,14 @@ static uint16_t fido_auth(struct u2f_raw_hdr *hdr, uint16_t len)
         sw = ECOND;
         goto cleanup;
     }
+
+    /* Only a valid handle may request presence. Invalid handles should not
+     * light the button or make the user wait. */
+    if (!indicator_wait_for_button(0, 0, 0x20)) {
+        sw = ECOND;
+        goto cleanup;
+    }
+    user_presence = 0x01;
 
     be_u2f_counter = __builtin_bswap32(U2F_Counter);
     wc_InitSha256(&sha);
@@ -783,6 +789,10 @@ int parse_u2fhid_packet(const uint8_t *data)
         if (U2F_Message.len == 0)
             return 0;
 
+        /* A continuation from another channel cannot alter this request. */
+        if (cp->cid != U2F_Message.cid)
+            return 0;
+
         /* If we are received the wrong sequence, discard. */
         if (cp->seq != U2F_Message.exp_seq) {
             U2F_Message.len = 0;
@@ -804,6 +814,8 @@ int parse_u2fhid_packet(const uint8_t *data)
         /* Finally parse the raw packet */
         uint32_t cid = U2F_Message.cid;
         uint16_t ret = parse_u2f_raw();
+        /* The request is complete, even when its response spans frames. */
+        U2F_Message.len = 0;
         if (ret != ENOERR) {
             /* Defensive: parse_u2f_raw() now reports its own errors, so this
              * should not trigger. Never send an unformatted buffer here. */
@@ -857,6 +869,7 @@ void tud_hid_report_complete_cb(uint8_t instance, uint8_t const* report, uint8_t
         uint16_t remain_size;
         uint8_t u2h_msg[U2FHID_PACKET_SIZE];
         memset(u2h_msg, 0, U2FHID_PACKET_SIZE);
+        memcpy(u2h_msg, &U2F_cmd_reply_cid, sizeof(U2F_cmd_reply_cid));
         /* 7-bit sequence, wraps at 128 per CTAPHID. */
         u2h_msg[4] = (uint8_t)(U2F_cmd_reply_seq & 0x7FU);
         U2F_cmd_reply_seq++;

@@ -188,6 +188,60 @@ int main(void)
         }
     }
 
+    /* A completed request must not be executed again by a stray continuation. */
+    {
+        uint8_t pkt[64] = {0};
+        build_init_packet(pkt, CID_TEST, 0x03, 8, u2f_ver);
+        frame_count = 0;
+        parse_u2fhid_packet(pkt);
+        memset(pkt, 0, sizeof(pkt));
+        memcpy(pkt, &cid_test, 4);
+        parse_u2fhid_packet(pkt);
+        if (frame_count != 1) {
+            printf("FAIL completed request replay: %d frames\n", frame_count);
+            failures++;
+        } else {
+            printf("PASS completed request retired\n");
+        }
+    }
+
+    /* Continuation replies must carry the request CID. */
+    {
+        uint8_t pkt[64];
+        stub_ctap2_fail = 0;
+        stub_ctap2_reply_len = 100;
+        build_init_packet(pkt, CID_TEST, 0x10, 8, cbor);
+        frame_count = 0;
+        parse_u2fhid_packet(pkt);
+        tud_hid_report_complete_cb(0, NULL, 64);
+        if (frame_count != 2 || memcmp(frames[1], &cid_test, 4) != 0) {
+            printf("FAIL reply continuation CID\n");
+            failures++;
+        } else {
+            printf("PASS reply continuation CID\n");
+        }
+        stub_ctap2_fail = 1;
+    }
+
+    /* Another channel cannot complete a pending request. */
+    {
+        uint8_t pkt[64];
+        uint8_t tail[64] = {0};
+        uint8_t long_version[57] = { 0x00, 0x03 };
+        uint32_t other_cid = CID_TEST + 1;
+        build_init_packet(pkt, CID_TEST, 0x03, 60, long_version);
+        frame_count = 0;
+        parse_u2fhid_packet(pkt);
+        memcpy(tail, &other_cid, 4);
+        parse_u2fhid_packet(tail);
+        if (frame_count != 0) {
+            printf("FAIL foreign continuation completed request\n");
+            failures++;
+        } else {
+            printf("PASS foreign continuation ignored\n");
+        }
+    }
+
     if (failures) {
         printf("\n%d FAILURE(S)\n", failures);
         return 1;
